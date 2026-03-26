@@ -654,8 +654,8 @@ app.get('/api/start-amendment', async (req, res) => {
       try {
         await createAssociation('0-3', deal.id, '0-2', companyIds[0]);
       } catch (e) {
-        console.warn('[start-amendment] Company association failed (likely stale contact IDs on company):', e.response?.data?.message || e.message);
-        warnings.push('Deal created but company association failed — some contacts on this company may be invalid');
+        console.warn('[start-amendment] Company association failed:', e.response?.data?.message || e.message);
+        warnings.push('Company association failed — some contacts on this company may be invalid');
       }
     }
 
@@ -663,6 +663,20 @@ app.get('/api/start-amendment', async (req, res) => {
       await createAssociation(contractTypeId, contractId, '0-3', deal.id);
     } catch (e) {
       console.warn('[start-amendment] Could not associate deal to contract:', e.message);
+    }
+
+    const contactIds = await getAssociatedIds(contractTypeId, contractId, '0-1');
+    let contactsLinked = 0;
+    for (const cid of contactIds) {
+      try {
+        await createAssociation('0-3', deal.id, '0-1', cid);
+        contactsLinked++;
+      } catch (e) {
+        console.warn(`[start-amendment] Skipping invalid contact ${cid}:`, e.response?.data?.message || e.message);
+      }
+    }
+    if (contactIds.length > 0 && contactsLinked < contactIds.length) {
+      warnings.push(`${contactIds.length - contactsLinked} of ${contactIds.length} contact associations failed (likely deleted contacts)`);
     }
 
     const amendCount = (parseInt(props.amendment_count) || 0) + 1;
@@ -675,6 +689,7 @@ app.get('/api/start-amendment', async (req, res) => {
       message: `${amendmentType === 'expansion' ? 'Expansion' : 'Contraction'} amendment deal created`,
       dealId: deal.id,
       dealName,
+      contactsLinked,
       warnings: warnings.length > 0 ? warnings : undefined,
     });
   } catch (e) {
@@ -797,8 +812,8 @@ app.get('/api/create-renewal-deal', async (req, res) => {
       try {
         await createAssociation('0-3', deal.id, '0-2', companyIds[0]);
       } catch (e) {
-        console.warn('[create-renewal] Company association failed (likely stale contact IDs on company):', e.response?.data?.message || e.message);
-        warnings.push('Deal created but company association failed — some contacts on this company may be invalid');
+        console.warn('[create-renewal] Company association failed:', e.response?.data?.message || e.message);
+        warnings.push('Company association failed — some contacts on this company may be invalid');
       }
     }
 
@@ -808,11 +823,26 @@ app.get('/api/create-renewal-deal', async (req, res) => {
       console.warn('[create-renewal] Could not associate deal to contract:', e.message);
     }
 
+    const contactIds = await getAssociatedIds(contractTypeId, contractId, '0-1');
+    let contactsLinked = 0;
+    for (const cid of contactIds) {
+      try {
+        await createAssociation('0-3', deal.id, '0-1', cid);
+        contactsLinked++;
+      } catch (e) {
+        console.warn(`[create-renewal] Skipping invalid contact ${cid}:`, e.response?.data?.message || e.message);
+      }
+    }
+    if (contactIds.length > 0 && contactsLinked < contactIds.length) {
+      warnings.push(`${contactIds.length - contactsLinked} of ${contactIds.length} contact associations failed (likely deleted contacts)`);
+    }
+
     res.json({
       success: true,
       message: `Renewal deal created: ${fmtDateForHS(renewalStart)} → ${fmtDateForHS(renewalEnd)}`,
       dealId: deal.id,
       dealName,
+      contactsLinked,
       warnings: warnings.length > 0 ? warnings : undefined,
     });
   } catch (e) {
