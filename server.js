@@ -46,30 +46,27 @@ const CONTRACT_SCHEMA = {
   labels: { singular: 'Contract', plural: 'Contracts' },
   primaryDisplayProperty: 'contract_name',
   requiredProperties: ['contract_name'],
-  searchableProperties: ['contract_name', 'status'],
+  searchableProperties: ['contract_name', 'contract_number', 'status'],
   properties: [
+    // ── Core identity ───────────────────────────────────────────────────
     { name: 'contract_name', label: 'Contract Name', type: 'string', fieldType: 'text', hasUniqueValue: false },
+    { name: 'contract_number', label: 'Contract Number', type: 'string', fieldType: 'text' },
+    { name: 'sf_contract_id', label: 'Salesforce Contract ID', type: 'string', fieldType: 'text' },
+    { name: 'description', label: 'Description', type: 'string', fieldType: 'textarea' },
+
+    // ── Status ──────────────────────────────────────────────────────────
     {
       name: 'status', label: 'Status', type: 'enumeration', fieldType: 'select',
       options: [
+        { label: 'Draft', value: 'draft' },
+        { label: 'In Approval Process', value: 'in_approval_process' },
         { label: 'Active', value: 'active' },
         { label: 'Future', value: 'future' },
         { label: 'Inactive', value: 'inactive' },
+        { label: 'Expired', value: 'expired' },
         { label: 'Terminated', value: 'terminated' },
       ],
     },
-    { name: 'start_date', label: 'Start Date', type: 'date', fieldType: 'date' },
-    { name: 'end_date', label: 'End Date', type: 'date', fieldType: 'date' },
-    { name: 'co_term_date', label: 'Co-Term Date', type: 'date', fieldType: 'date' },
-    { name: 'total_arr', label: 'Total ARR', type: 'number', fieldType: 'number' },
-    { name: 'lq_arr', label: 'LQ ARR', type: 'number', fieldType: 'number' },
-    { name: 'fcm_arr', label: 'FCM ARR', type: 'number', fieldType: 'number' },
-    { name: 'total_tcv', label: 'Total TCV', type: 'number', fieldType: 'number' },
-    { name: 'subscription_count', label: 'Subscription Count', type: 'number', fieldType: 'number' },
-    { name: 'amendment_count', label: 'Amendment Count', type: 'number', fieldType: 'number' },
-    { name: 'contract_data', label: 'Contract Data', type: 'string', fieldType: 'textarea' },
-    { name: 'activated_date', label: 'Activated Date', type: 'date', fieldType: 'date' },
-    { name: 'terminated_date', label: 'Terminated Date', type: 'date', fieldType: 'date' },
     {
       name: 'termination_reason', label: 'Termination Reason', type: 'enumeration', fieldType: 'select',
       options: [
@@ -82,6 +79,90 @@ const CONTRACT_SCHEMA = {
         { label: 'Other', value: 'other' },
       ],
     },
+
+    // ── Dates ────────────────────────────────────────────────────────────
+    { name: 'start_date', label: 'Contract Start Date', type: 'date', fieldType: 'date' },
+    { name: 'end_date', label: 'Contract End Date', type: 'date', fieldType: 'date' },
+    { name: 'co_term_date', label: 'Co-Term Date', type: 'date', fieldType: 'date' },
+    { name: 'activated_date', label: 'Activated Date', type: 'date', fieldType: 'date' },
+    { name: 'terminated_date', label: 'Terminated Date', type: 'date', fieldType: 'date' },
+    { name: 'company_signed_date', label: 'Company Signed Date', type: 'date', fieldType: 'date' },
+    { name: 'customer_signed_date', label: 'Customer Signed Date', type: 'date', fieldType: 'date' },
+    { name: 'customer_signed_title', label: 'Customer Signed Title', type: 'string', fieldType: 'text' },
+    { name: 'amendment_start_date', label: 'Amendment Start Date', type: 'date', fieldType: 'date' },
+    { name: 'contract_renewed_on', label: 'Contract Renewed On', type: 'date', fieldType: 'date' },
+
+    // ── Term ─────────────────────────────────────────────────────────────
+    { name: 'contract_term', label: 'Contract Term (months)', type: 'number', fieldType: 'number' },
+    { name: 'previous_contract_term', label: 'Previous Contract Term', type: 'number', fieldType: 'number' },
+    { name: 'renewal_term', label: 'Renewal Term', type: 'number', fieldType: 'number' },
+    {
+      name: 'evergreen', label: 'Evergreen', type: 'enumeration', fieldType: 'booleancheckbox',
+      options: [{ label: 'Yes', value: 'true' }, { label: 'No', value: 'false' }],
+    },
+
+    // ── Financial / ARR ──────────────────────────────────────────────────
+    { name: 'total_arr', label: 'Total ARR', type: 'number', fieldType: 'number' },
+    { name: 'lq_arr', label: 'LQ Year1 ARR', type: 'number', fieldType: 'number' },
+    { name: 'fcm_arr', label: 'FCM Year1 ARR', type: 'number', fieldType: 'number' },
+    { name: 'portfolio_management_arr', label: 'Portfolio Management Year1 ARR', type: 'number', fieldType: 'number' },
+    { name: 'total_tcv', label: 'Total TCV', type: 'number', fieldType: 'number' },
+
+    // ── Pricing / Renewal ────────────────────────────────────────────────
+    { name: 'price_cap', label: 'Price Cap (%)', type: 'number', fieldType: 'number' },
+    { name: 'max_uplift', label: 'Max Uplift (%)', type: 'number', fieldType: 'number' },
+    { name: 'renewal_uplift_rate', label: 'Renewal Uplift (%)', type: 'number', fieldType: 'number' },
+    {
+      name: 'amendment_renewal_behavior', label: 'Amendment & Renewal Behavior', type: 'enumeration', fieldType: 'select',
+      options: [
+        { label: 'Latest End Date', value: 'latest_end_date' },
+        { label: 'Earliest End Date', value: 'earliest_end_date' },
+      ],
+    },
+    {
+      name: 'mdq_renewal_behavior', label: 'MDQ Renewal Behavior', type: 'enumeration', fieldType: 'select',
+      options: [{ label: 'De-segmented', value: 'de_segmented' }],
+    },
+    {
+      name: 'renewal_forecast', label: 'Renewal Forecast', type: 'enumeration', fieldType: 'booleancheckbox',
+      options: [{ label: 'Yes', value: 'true' }, { label: 'No', value: 'false' }],
+    },
+    {
+      name: 'renewal_quoted', label: 'Renewal Quoted', type: 'enumeration', fieldType: 'booleancheckbox',
+      options: [{ label: 'Yes', value: 'true' }, { label: 'No', value: 'false' }],
+    },
+
+    // ── Subscription rollups (populated by API) ──────────────────────────
+    { name: 'subscription_count', label: 'Subscription Count', type: 'number', fieldType: 'number' },
+    { name: 'amendment_count', label: 'Amendment Count', type: 'number', fieldType: 'number' },
+    { name: 'lq_active_subscriptions', label: 'LQ Current Active Record Subscriptions', type: 'number', fieldType: 'number' },
+    { name: 'lq_archived_subscriptions', label: 'LQ Current Archived Record Subscriptions', type: 'number', fieldType: 'number' },
+    { name: 'fcm_subscription_count', label: 'FCM Subscription Count', type: 'number', fieldType: 'number' },
+    { name: 'lq_subscription_count', label: 'Total LQ Subscription Count', type: 'number', fieldType: 'number' },
+    { name: 'fcm_core_product_count', label: 'FCM Core Product Count', type: 'number', fieldType: 'number' },
+    { name: 'fcm_additional_count', label: 'FCM Additional Count', type: 'number', fieldType: 'number' },
+    { name: 'portfolio_management_hours', label: 'Portfolio Management Hours Purchased', type: 'number', fieldType: 'number' },
+
+    // ── People ───────────────────────────────────────────────────────────
+    { name: 'activated_by', label: 'Activated By', type: 'string', fieldType: 'text' },
+    { name: 'renewal_owner', label: 'Renewal Owner', type: 'string', fieldType: 'text' },
+    { name: 'amendment_owner', label: 'Amendment Owner', type: 'string', fieldType: 'text' },
+
+    // ── Billing address ──────────────────────────────────────────────────
+    { name: 'billing_street', label: 'Billing Street', type: 'string', fieldType: 'text' },
+    { name: 'billing_city', label: 'Billing City', type: 'string', fieldType: 'text' },
+    { name: 'billing_state', label: 'Billing State/Province', type: 'string', fieldType: 'text' },
+    { name: 'billing_postal_code', label: 'Billing Zip/Postal Code', type: 'string', fieldType: 'text' },
+    { name: 'billing_country', label: 'Billing Country', type: 'string', fieldType: 'text' },
+
+    // ── Special terms / notes ────────────────────────────────────────────
+    { name: 'special_terms', label: 'Special Terms', type: 'string', fieldType: 'textarea' },
+
+    // ── Integration ──────────────────────────────────────────────────────
+    { name: 'netsuite_id', label: 'NetSuite ID', type: 'string', fieldType: 'text' },
+
+    // ── JSON blob for UIE ────────────────────────────────────────────────
+    { name: 'contract_data', label: 'Contract Data', type: 'string', fieldType: 'textarea' },
   ],
   associatedObjects: ['COMPANY', 'DEAL', 'CONTACT'],
 };
@@ -91,18 +172,54 @@ const SUBSCRIPTION_SCHEMA = {
   labels: { singular: 'Subscription Segment', plural: 'Subscription Segments' },
   primaryDisplayProperty: 'segment_name',
   requiredProperties: ['segment_name'],
-  searchableProperties: ['segment_name', 'product_code', 'status'],
+  searchableProperties: ['segment_name', 'product_code', 'product_name', 'status'],
   properties: [
+    // ── Core identity ───────────────────────────────────────────────────
     { name: 'segment_name', label: 'Segment Name', type: 'string', fieldType: 'text', hasUniqueValue: false },
-    { name: 'segment_year', label: 'Segment Year', type: 'number', fieldType: 'number' },
-    { name: 'start_date', label: 'Start Date', type: 'date', fieldType: 'date' },
-    { name: 'end_date', label: 'End Date', type: 'date', fieldType: 'date' },
+    { name: 'sf_subscription_id', label: 'Salesforce Subscription ID', type: 'string', fieldType: 'text' },
+    { name: 'subscription_number', label: 'Subscription #', type: 'string', fieldType: 'text' },
+
+    // ── Product ──────────────────────────────────────────────────────────
     { name: 'product_code', label: 'Product Code', type: 'string', fieldType: 'text' },
     { name: 'product_name', label: 'Product Name', type: 'string', fieldType: 'text' },
-    { name: 'arr', label: 'ARR', type: 'number', fieldType: 'number' },
-    { name: 'tcv', label: 'TCV', type: 'number', fieldType: 'number' },
-    { name: 'quantity', label: 'Quantity', type: 'number', fieldType: 'number' },
-    { name: 'unit_price', label: 'Unit Price', type: 'number', fieldType: 'number' },
+    {
+      name: 'product_subscription_type', label: 'Product Subscription Type', type: 'enumeration', fieldType: 'select',
+      options: [
+        { label: 'Evergreen', value: 'evergreen' },
+        { label: 'One-time', value: 'one_time' },
+        { label: 'Renewable', value: 'renewable' },
+        { label: 'Renewable/Evergreen', value: 'renewable_evergreen' },
+      ],
+    },
+    {
+      name: 'subscription_type', label: 'Subscription Type', type: 'enumeration', fieldType: 'select',
+      options: [
+        { label: 'Evergreen', value: 'evergreen' },
+        { label: 'One-time', value: 'one_time' },
+        { label: 'Renewable', value: 'renewable' },
+        { label: 'Renewable/Evergreen', value: 'renewable_evergreen' },
+      ],
+    },
+    {
+      name: 'charge_type', label: 'Charge Type', type: 'enumeration', fieldType: 'select',
+      options: [
+        { label: 'One-Time', value: 'one_time' },
+        { label: 'Recurring', value: 'recurring' },
+        { label: 'Usage', value: 'usage' },
+      ],
+    },
+    {
+      name: 'billing_frequency', label: 'Billing Frequency', type: 'enumeration', fieldType: 'select',
+      options: [
+        { label: 'Annual', value: 'annual' },
+        { label: 'Monthly', value: 'monthly' },
+        { label: 'Quarterly', value: 'quarterly' },
+        { label: 'Semiannual', value: 'semiannual' },
+        { label: 'Invoice Plan', value: 'invoice_plan' },
+      ],
+    },
+
+    // ── Status ──────────────────────────────────────────────────────────
     {
       name: 'status', label: 'Status', type: 'enumeration', fieldType: 'select',
       options: [
@@ -121,6 +238,86 @@ const SUBSCRIPTION_SCHEMA = {
       ],
     },
     { name: 'amendment_indicator', label: 'Amendment Indicator', type: 'string', fieldType: 'text' },
+    {
+      name: 'bundled', label: 'Bundled', type: 'enumeration', fieldType: 'booleancheckbox',
+      options: [{ label: 'Yes', value: 'true' }, { label: 'No', value: 'false' }],
+    },
+
+    // ── Dates ────────────────────────────────────────────────────────────
+    { name: 'start_date', label: 'Start Date', type: 'date', fieldType: 'date' },
+    { name: 'end_date', label: 'End Date', type: 'date', fieldType: 'date' },
+    { name: 'subscription_start_date', label: 'Subscription Start Date', type: 'date', fieldType: 'date' },
+    { name: 'subscription_end_date', label: 'Subscription End Date', type: 'date', fieldType: 'date' },
+    { name: 'arr_start_date', label: 'ARR Start Date', type: 'date', fieldType: 'date' },
+    { name: 'arr_end_date', label: 'ARR End Date', type: 'date', fieldType: 'date' },
+    { name: 'terminated_date', label: 'Terminated Date', type: 'date', fieldType: 'date' },
+    { name: 'renewed_date', label: 'Renewed Date', type: 'date', fieldType: 'date' },
+
+    // ── Segment (MDQ) ────────────────────────────────────────────────────
+    { name: 'segment_year', label: 'Segment Year', type: 'number', fieldType: 'number' },
+    { name: 'segment_label', label: 'Segment Label', type: 'string', fieldType: 'text' },
+    { name: 'segment_index', label: 'Segment Index', type: 'number', fieldType: 'number' },
+    { name: 'segment_key', label: 'Segment Key', type: 'string', fieldType: 'text' },
+    { name: 'segment_start_date', label: 'Segment Start Date', type: 'date', fieldType: 'date' },
+    { name: 'segment_end_date', label: 'Segment End Date', type: 'date', fieldType: 'date' },
+    { name: 'segment_quantity', label: 'Segment Quantity', type: 'number', fieldType: 'number' },
+    { name: 'segment_uplift', label: 'Segment Uplift (%)', type: 'number', fieldType: 'number' },
+    { name: 'segment_uplift_amount', label: 'Segment Uplift (Amt)', type: 'number', fieldType: 'number' },
+
+    // ── Quantity ──────────────────────────────────────────────────────────
+    { name: 'quantity', label: 'Quantity', type: 'number', fieldType: 'number' },
+    { name: 'original_quantity', label: 'Original Quantity', type: 'number', fieldType: 'number' },
+    { name: 'renewal_quantity', label: 'Renewal Quantity', type: 'number', fieldType: 'number' },
+    { name: 'number_position', label: 'Number', type: 'number', fieldType: 'number' },
+    { name: 'option_level', label: 'Option Level', type: 'number', fieldType: 'number' },
+    {
+      name: 'option_type', label: 'Option Type', type: 'enumeration', fieldType: 'select',
+      options: [
+        { label: 'Accessory', value: 'accessory' },
+        { label: 'Component', value: 'component' },
+        { label: 'Related Product', value: 'related_product' },
+      ],
+    },
+
+    // ── Pricing ──────────────────────────────────────────────────────────
+    { name: 'unit_price', label: 'Unit Price', type: 'number', fieldType: 'number' },
+    { name: 'list_price', label: 'List Price', type: 'number', fieldType: 'number' },
+    { name: 'net_price', label: 'Net Price', type: 'number', fieldType: 'number' },
+    { name: 'regular_price', label: 'Regular Price', type: 'number', fieldType: 'number' },
+    { name: 'special_price', label: 'Special Price', type: 'number', fieldType: 'number' },
+    { name: 'customer_price', label: 'Customer Price', type: 'number', fieldType: 'number' },
+    { name: 'discount_percent', label: 'Additional Disc. (%)', type: 'number', fieldType: 'number' },
+    { name: 'discount_amount', label: 'Additional Disc. (Amt)', type: 'number', fieldType: 'number' },
+    { name: 'prorate_multiplier', label: 'Prorate Multiplier', type: 'number', fieldType: 'number' },
+    {
+      name: 'pricing_method', label: 'Pricing Method', type: 'enumeration', fieldType: 'select',
+      options: [
+        { label: 'List', value: 'list' },
+        { label: 'Cost', value: 'cost' },
+        { label: 'Block', value: 'block' },
+        { label: 'Custom', value: 'custom' },
+        { label: 'Percent Of Total', value: 'percent_of_total' },
+      ],
+    },
+    {
+      name: 'subscription_pricing', label: 'Subscription Pricing', type: 'enumeration', fieldType: 'select',
+      options: [
+        { label: 'Fixed Price', value: 'fixed_price' },
+        { label: 'Percent Of Total', value: 'percent_of_total' },
+      ],
+    },
+
+    // ── Revenue metrics ──────────────────────────────────────────────────
+    { name: 'arr', label: 'ARR', type: 'number', fieldType: 'number' },
+    { name: 'mrr', label: 'MRR', type: 'number', fieldType: 'number' },
+    { name: 'tcv', label: 'TCV', type: 'number', fieldType: 'number' },
+
+    // ── Renewal pricing ──────────────────────────────────────────────────
+    { name: 'renewal_price', label: 'Renewal Price', type: 'number', fieldType: 'number' },
+    { name: 'renewal_list_price_override', label: 'Renewal List Price Override', type: 'number', fieldType: 'number' },
+    { name: 'renewal_uplift_rate', label: 'Renewal Uplift (%)', type: 'number', fieldType: 'number' },
+    { name: 'price_cap_amount', label: 'Price Cap Amount', type: 'number', fieldType: 'number' },
+    { name: 'price_cap_multiplier', label: 'Price Cap Multiplier', type: 'number', fieldType: 'number' },
   ],
   associatedObjects: ['COMPANY'],
 };
@@ -143,16 +340,45 @@ const DEAL_PROPERTIES = [
 // ── CRM helpers ──────────────────────────────────────────────────────────────
 
 const CONTRACT_PROPS = [
-  'contract_name', 'status', 'start_date', 'end_date', 'co_term_date',
-  'total_arr', 'lq_arr', 'fcm_arr', 'total_tcv', 'subscription_count',
-  'amendment_count', 'contract_data', 'activated_date', 'terminated_date',
-  'termination_reason',
+  'contract_name', 'contract_number', 'sf_contract_id', 'description',
+  'status', 'termination_reason',
+  'start_date', 'end_date', 'co_term_date', 'activated_date', 'terminated_date',
+  'company_signed_date', 'customer_signed_date', 'customer_signed_title',
+  'amendment_start_date', 'contract_renewed_on',
+  'contract_term', 'previous_contract_term', 'renewal_term', 'evergreen',
+  'total_arr', 'lq_arr', 'fcm_arr', 'portfolio_management_arr', 'total_tcv',
+  'price_cap', 'max_uplift', 'renewal_uplift_rate',
+  'amendment_renewal_behavior', 'mdq_renewal_behavior',
+  'renewal_forecast', 'renewal_quoted',
+  'subscription_count', 'amendment_count',
+  'lq_active_subscriptions', 'lq_archived_subscriptions',
+  'fcm_subscription_count', 'lq_subscription_count',
+  'fcm_core_product_count', 'fcm_additional_count',
+  'portfolio_management_hours',
+  'activated_by', 'renewal_owner', 'amendment_owner',
+  'billing_street', 'billing_city', 'billing_state', 'billing_postal_code', 'billing_country',
+  'special_terms', 'netsuite_id', 'contract_data',
 ];
 
 const SUBSCRIPTION_PROPS = [
-  'segment_name', 'segment_year', 'start_date', 'end_date', 'product_code',
-  'product_name', 'arr', 'tcv', 'quantity', 'unit_price', 'status',
-  'proration_status', 'amendment_indicator',
+  'segment_name', 'sf_subscription_id', 'subscription_number',
+  'product_code', 'product_name', 'product_subscription_type',
+  'subscription_type', 'charge_type', 'billing_frequency',
+  'status', 'proration_status', 'amendment_indicator', 'bundled',
+  'start_date', 'end_date', 'subscription_start_date', 'subscription_end_date',
+  'arr_start_date', 'arr_end_date', 'terminated_date', 'renewed_date',
+  'segment_year', 'segment_label', 'segment_index', 'segment_key',
+  'segment_start_date', 'segment_end_date', 'segment_quantity',
+  'segment_uplift', 'segment_uplift_amount',
+  'quantity', 'original_quantity', 'renewal_quantity',
+  'number_position', 'option_level', 'option_type',
+  'unit_price', 'list_price', 'net_price', 'regular_price',
+  'special_price', 'customer_price',
+  'discount_percent', 'discount_amount', 'prorate_multiplier',
+  'pricing_method', 'subscription_pricing',
+  'arr', 'mrr', 'tcv',
+  'renewal_price', 'renewal_list_price_override',
+  'renewal_uplift_rate', 'price_cap_amount', 'price_cap_multiplier',
 ];
 
 async function getObject(typeId, objectId, properties) {
@@ -184,8 +410,7 @@ async function getAssociatedIds(fromType, fromId, toType) {
 
 async function createAssociation(fromType, fromId, toType, toId) {
   await hs.put(
-    `/crm/v4/objects/${fromType}/${fromId}/associations/${toType}/${toId}`,
-    [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 1 }]
+    `/crm/v4/objects/${fromType}/${fromId}/associations/default/${toType}/${toId}`
   );
 }
 
@@ -422,9 +647,16 @@ app.get('/api/start-amendment', async (req, res) => {
 
     const deal = await createObject('0-3', dealProps);
 
+    const warnings = [];
+
     const companyIds = await getAssociatedIds(contractTypeId, contractId, '0-2');
     if (companyIds.length > 0) {
-      await createAssociation('0-3', deal.id, '0-2', companyIds[0]);
+      try {
+        await createAssociation('0-3', deal.id, '0-2', companyIds[0]);
+      } catch (e) {
+        console.warn('[start-amendment] Company association failed (likely stale contact IDs on company):', e.response?.data?.message || e.message);
+        warnings.push('Deal created but company association failed — some contacts on this company may be invalid');
+      }
     }
 
     try {
@@ -443,6 +675,7 @@ app.get('/api/start-amendment', async (req, res) => {
       message: `${amendmentType === 'expansion' ? 'Expansion' : 'Contraction'} amendment deal created`,
       dealId: deal.id,
       dealName,
+      warnings: warnings.length > 0 ? warnings : undefined,
     });
   } catch (e) {
     console.error('[start-amendment] Error:', e.response?.data || e.message);
@@ -481,6 +714,53 @@ app.get('/api/terminate-contract', async (req, res) => {
   }
 });
 
+// ── Route: Reverse Termination ───────────────────────────────────────────────
+
+app.get('/api/reverse-termination', async (req, res) => {
+  try {
+    const { contractId } = req.query;
+    if (!contractId) return res.status(400).json({ success: false, message: 'contractId required' });
+
+    await resolveTypeIds();
+    const contract = await getObject(contractTypeId, contractId, CONTRACT_PROPS);
+    const props = contract.properties;
+
+    if (props.status !== 'terminated') {
+      return res.json({ success: false, message: 'Contract is not terminated' });
+    }
+
+    const newStatus = determineStatus(props.start_date, props.end_date);
+
+    await updateObject(contractTypeId, contractId, {
+      status: newStatus,
+      terminated_date: '',
+      termination_reason: '',
+    });
+
+    if (subscriptionTypeId) {
+      const subIds = await getAssociatedIds(contractTypeId, contractId, subscriptionTypeId);
+      for (const sid of subIds) {
+        try {
+          const sub = await getObject(subscriptionTypeId, sid, SUBSCRIPTION_PROPS);
+          if (sub.properties.status === 'terminated') {
+            const subStatus = determineStatus(sub.properties.start_date, sub.properties.end_date);
+            await updateObject(subscriptionTypeId, sid, { status: subStatus });
+          }
+        } catch (e) { /* skip */ }
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `Termination reversed — contract status set to ${newStatus}`,
+      status: newStatus,
+    });
+  } catch (e) {
+    console.error('[reverse-termination] Error:', e.response?.data || e.message);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 // ── Route: Create Renewal Deal ───────────────────────────────────────────────
 
 app.get('/api/create-renewal-deal', async (req, res) => {
@@ -510,9 +790,16 @@ app.get('/api/create-renewal-deal', async (req, res) => {
       pipeline: 'default',
     });
 
+    const warnings = [];
+
     const companyIds = await getAssociatedIds(contractTypeId, contractId, '0-2');
     if (companyIds.length > 0) {
-      await createAssociation('0-3', deal.id, '0-2', companyIds[0]);
+      try {
+        await createAssociation('0-3', deal.id, '0-2', companyIds[0]);
+      } catch (e) {
+        console.warn('[create-renewal] Company association failed (likely stale contact IDs on company):', e.response?.data?.message || e.message);
+        warnings.push('Deal created but company association failed — some contacts on this company may be invalid');
+      }
     }
 
     try {
@@ -526,6 +813,7 @@ app.get('/api/create-renewal-deal', async (req, res) => {
       message: `Renewal deal created: ${fmtDateForHS(renewalStart)} → ${fmtDateForHS(renewalEnd)}`,
       dealId: deal.id,
       dealName,
+      warnings: warnings.length > 0 ? warnings : undefined,
     });
   } catch (e) {
     console.error('[create-renewal-deal] Error:', e.response?.data || e.message);
@@ -656,6 +944,102 @@ app.get('/api/load-account-rollups', async (req, res) => {
   }
 });
 
+// ── Route: Load Deal CPQ ─────────────────────────────────────────────────────
+
+app.get('/api/load-deal-cpq', async (req, res) => {
+  try {
+    const { dealId } = req.query;
+    if (!dealId) return res.status(400).json({ success: false, message: 'dealId required' });
+
+    await resolveTypeIds();
+
+    const deal = await getObject('0-3', dealId, [
+      'dealname', 'dealstage', 'amount', 'closedate', 'deal_category',
+      'contract_start_date', 'contract_end_date', 'pipeline', 'hubspot_owner_id',
+    ]);
+
+    let sourceContract = null;
+    let subscriptions = [];
+    let contractId = null;
+
+    if (contractTypeId) {
+      const contractIds = await getAssociatedIds('0-3', dealId, contractTypeId);
+      if (contractIds.length > 0) {
+        contractId = contractIds[0];
+        try {
+          sourceContract = await getObject(contractTypeId, contractId, CONTRACT_PROPS);
+        } catch (e) { /* non-critical */ }
+
+        if (sourceContract && subscriptionTypeId) {
+          const subIds = await getAssociatedIds(contractTypeId, contractId, subscriptionTypeId);
+          if (subIds.length > 0) {
+            const fetches = subIds.map((id) => getObject(subscriptionTypeId, id, SUBSCRIPTION_PROPS));
+            subscriptions = await Promise.all(fetches);
+          }
+        }
+      }
+    }
+
+    const companyIds = await getAssociatedIds('0-3', dealId, '0-2');
+    let company = null;
+    if (companyIds.length > 0) {
+      try {
+        company = await getObject('0-2', companyIds[0], ['name', 'domain', 'city', 'state', 'country']);
+      } catch (e) { /* non-critical */ }
+    }
+
+    const contactIds = await getAssociatedIds('0-3', dealId, '0-1');
+    const contacts = [];
+    for (const cid of contactIds) {
+      try {
+        const c = await getObject('0-1', cid, ['firstname', 'lastname', 'email', 'jobtitle']);
+        contacts.push({
+          id: c.id,
+          name: [c.properties.firstname, c.properties.lastname].filter(Boolean).join(' '),
+          email: c.properties.email,
+          title: c.properties.jobtitle,
+        });
+      } catch (e) { /* skip */ }
+    }
+
+    let portalId = null;
+    try {
+      const { data: acct } = await hs.get('/account-info/v3/details');
+      portalId = acct.portalId;
+    } catch (e) { /* non-critical */ }
+
+    const isClosedWon = deal.properties.dealstage === 'closedwon';
+    const category = deal.properties.deal_category || 'new_business';
+
+    res.json({
+      success: true,
+      deal: {
+        id: deal.id,
+        name: deal.properties.dealname,
+        stage: deal.properties.dealstage,
+        amount: deal.properties.amount,
+        closeDate: deal.properties.closedate,
+        category,
+        contractStartDate: deal.properties.contract_start_date,
+        contractEndDate: deal.properties.contract_end_date,
+        pipeline: deal.properties.pipeline,
+        ownerId: deal.properties.hubspot_owner_id,
+      },
+      sourceContract,
+      contractId,
+      subscriptions,
+      company,
+      contacts,
+      portalId,
+      productRegistry: PRODUCT_REGISTRY,
+      isClosedWon,
+    });
+  } catch (e) {
+    console.error('[load-deal-cpq] Error:', e.response?.data || e.message);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 // ── Route: Update Contract from Deal (webhook) ──────────────────────────────
 
 app.post('/api/update-contract-from-deal', async (req, res) => {
@@ -738,6 +1122,268 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
   } catch (e) {
     console.error('[update-contract-from-deal] Error:', e.response?.data || e.message);
     res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ── Route: Seed Subscription Segments ─────────────────────────────────────────
+
+app.get('/api/seed-subscriptions', async (req, res) => {
+  try {
+    await resolveTypeIds();
+    if (!contractTypeId || !subscriptionTypeId) {
+      return res.status(500).json({ success: false, message: 'Schemas not ready — hit /api/ensure-setup first' });
+    }
+
+    const { data: searchResult } = await hs.post(`/crm/v3/objects/${contractTypeId}/search`, {
+      filterGroups: [],
+      properties: ['contract_name', 'contract_number', 'status', 'start_date', 'end_date', 'total_arr'],
+      limit: 20,
+    });
+
+    const contracts = searchResult.results || [];
+    if (contracts.length === 0) {
+      return res.json({ success: false, message: 'No contracts found in portal' });
+    }
+
+    const results = [];
+
+    for (const contract of contracts) {
+      const cp = contract.properties;
+      const cId = contract.id;
+
+      const existingSubIds = await getAssociatedIds(contractTypeId, cId, subscriptionTypeId);
+      if (existingSubIds.length > 0) {
+        results.push({ contractId: cId, name: cp.contract_name, skipped: true, reason: `Already has ${existingSubIds.length} subscriptions` });
+        continue;
+      }
+
+      const startDate = cp.start_date || '2025-01-01';
+      const startYear = new Date(startDate).getFullYear();
+      const startMonth = new Date(startDate).getMonth();
+      const startDay = new Date(startDate).getDate();
+
+      function segDate(yearOffset, month, day) {
+        const y = startYear + yearOffset;
+        const m = month !== undefined ? month : startMonth;
+        const d = day !== undefined ? day : startDay;
+        return `${y}-${String(m + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+      }
+
+      function segEndDate(yearOffset, month, day) {
+        const y = startYear + yearOffset;
+        const m = month !== undefined ? month : startMonth;
+        const d = day !== undefined ? day : startDay;
+        const dt = new Date(y, m, d);
+        dt.setDate(dt.getDate() - 1);
+        return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`;
+      }
+
+      const contractName = cp.contract_name || 'Contract';
+
+      const subs = [
+        {
+          segment_name: `${contractName} — LQ Year 1`,
+          subscription_number: `SUB-${cId}-LQ-01`,
+          product_code: 'LQ',
+          product_name: 'LeaseQuery',
+          product_subscription_type: 'renewable',
+          subscription_type: 'renewable',
+          charge_type: 'recurring',
+          billing_frequency: 'annual',
+          status: 'inactive',
+          segment_year: '1',
+          segment_label: 'Year 1',
+          segment_index: '1',
+          start_date: segDate(0),
+          end_date: segEndDate(1),
+          segment_start_date: segDate(0),
+          segment_end_date: segEndDate(1),
+          arr_start_date: segDate(0),
+          arr_end_date: segEndDate(1),
+          subscription_start_date: segDate(0),
+          subscription_end_date: cp.end_date || segEndDate(3),
+          quantity: '200',
+          unit_price: '500',
+          list_price: '600',
+          net_price: '100000',
+          regular_price: '500',
+          customer_price: '500',
+          discount_percent: '16.67',
+          prorate_multiplier: '1',
+          pricing_method: 'list',
+          arr: '100000',
+          mrr: '8333.33',
+          tcv: '100000',
+        },
+        {
+          segment_name: `${contractName} — LQ Year 2`,
+          subscription_number: `SUB-${cId}-LQ-02`,
+          product_code: 'LQ',
+          product_name: 'LeaseQuery',
+          product_subscription_type: 'renewable',
+          subscription_type: 'renewable',
+          charge_type: 'recurring',
+          billing_frequency: 'annual',
+          status: 'active',
+          segment_year: '2',
+          segment_label: 'Year 2',
+          segment_index: '2',
+          segment_uplift: '3',
+          start_date: segDate(1),
+          end_date: segEndDate(2),
+          segment_start_date: segDate(1),
+          segment_end_date: segEndDate(2),
+          arr_start_date: segDate(1),
+          arr_end_date: segEndDate(2),
+          subscription_start_date: segDate(0),
+          subscription_end_date: cp.end_date || segEndDate(3),
+          quantity: '200',
+          unit_price: '515',
+          list_price: '600',
+          net_price: '103000',
+          regular_price: '515',
+          customer_price: '515',
+          discount_percent: '14.17',
+          prorate_multiplier: '1',
+          pricing_method: 'list',
+          arr: '103000',
+          mrr: '8583.33',
+          tcv: '103000',
+        },
+        {
+          segment_name: `${contractName} — LQ Year 3`,
+          subscription_number: `SUB-${cId}-LQ-03`,
+          product_code: 'LQ',
+          product_name: 'LeaseQuery',
+          product_subscription_type: 'renewable',
+          subscription_type: 'renewable',
+          charge_type: 'recurring',
+          billing_frequency: 'annual',
+          status: 'future',
+          segment_year: '3',
+          segment_label: 'Year 3',
+          segment_index: '3',
+          segment_uplift: '3',
+          start_date: segDate(2),
+          end_date: segEndDate(3),
+          segment_start_date: segDate(2),
+          segment_end_date: segEndDate(3),
+          arr_start_date: segDate(2),
+          arr_end_date: segEndDate(3),
+          subscription_start_date: segDate(0),
+          subscription_end_date: cp.end_date || segEndDate(3),
+          quantity: '200',
+          unit_price: '530.45',
+          list_price: '600',
+          net_price: '106090',
+          regular_price: '530.45',
+          customer_price: '530.45',
+          discount_percent: '11.59',
+          prorate_multiplier: '1',
+          pricing_method: 'list',
+          arr: '106090',
+          mrr: '8840.83',
+          tcv: '106090',
+        },
+        {
+          segment_name: `${contractName} — FCM Year 1`,
+          subscription_number: `SUB-${cId}-FCM-01`,
+          product_code: 'FCM',
+          product_name: 'Financial Close Management',
+          product_subscription_type: 'renewable',
+          subscription_type: 'renewable',
+          charge_type: 'recurring',
+          billing_frequency: 'annual',
+          status: 'active',
+          amendment_indicator: 'Expansion',
+          segment_year: '1',
+          segment_label: 'Year 1',
+          segment_index: '1',
+          start_date: segDate(0, startMonth + 6 > 11 ? startMonth + 6 - 12 : startMonth + 6, 1),
+          end_date: segEndDate(2),
+          segment_start_date: segDate(0, startMonth + 6 > 11 ? startMonth + 6 - 12 : startMonth + 6, 1),
+          segment_end_date: segEndDate(2),
+          arr_start_date: segDate(0, startMonth + 6 > 11 ? startMonth + 6 - 12 : startMonth + 6, 1),
+          arr_end_date: segEndDate(2),
+          subscription_start_date: segDate(0, startMonth + 6 > 11 ? startMonth + 6 - 12 : startMonth + 6, 1),
+          subscription_end_date: cp.end_date || segEndDate(3),
+          quantity: '1',
+          unit_price: '55000',
+          list_price: '65000',
+          net_price: '55000',
+          regular_price: '55000',
+          customer_price: '55000',
+          discount_percent: '15.38',
+          prorate_multiplier: '1',
+          pricing_method: 'list',
+          arr: '55000',
+          mrr: '4583.33',
+          tcv: '55000',
+        },
+        {
+          segment_name: `${contractName} — FCM Year 2`,
+          subscription_number: `SUB-${cId}-FCM-02`,
+          product_code: 'FCM',
+          product_name: 'Financial Close Management',
+          product_subscription_type: 'renewable',
+          subscription_type: 'renewable',
+          charge_type: 'recurring',
+          billing_frequency: 'annual',
+          status: 'future',
+          amendment_indicator: 'Expansion',
+          segment_year: '2',
+          segment_label: 'Year 2',
+          segment_index: '2',
+          segment_uplift: '3',
+          start_date: segDate(2),
+          end_date: segEndDate(3),
+          segment_start_date: segDate(2),
+          segment_end_date: segEndDate(3),
+          arr_start_date: segDate(2),
+          arr_end_date: segEndDate(3),
+          subscription_start_date: segDate(0, startMonth + 6 > 11 ? startMonth + 6 - 12 : startMonth + 6, 1),
+          subscription_end_date: cp.end_date || segEndDate(3),
+          quantity: '1',
+          unit_price: '56650',
+          list_price: '65000',
+          net_price: '56650',
+          regular_price: '56650',
+          customer_price: '56650',
+          discount_percent: '12.85',
+          prorate_multiplier: '1',
+          pricing_method: 'list',
+          arr: '56650',
+          mrr: '4720.83',
+          tcv: '56650',
+        },
+      ];
+
+      const createdIds = [];
+      for (const sub of subs) {
+        const record = await createObject(subscriptionTypeId, sub);
+        createdIds.push(record.id);
+        try { await createAssociation(contractTypeId, cId, subscriptionTypeId, record.id); } catch (e) { /* ok */ }
+        const companyIds = await getAssociatedIds(contractTypeId, cId, '0-2');
+        if (companyIds.length > 0) {
+          try { await createAssociation(subscriptionTypeId, record.id, '0-2', companyIds[0]); } catch (e) { /* ok */ }
+        }
+      }
+
+      await updateObject(contractTypeId, cId, {
+        total_arr: '158000',
+        lq_arr: '103000',
+        fcm_arr: '55000',
+        total_tcv: '523740',
+        subscription_count: String(subs.length),
+      });
+
+      results.push({ contractId: cId, name: cp.contract_name, created: createdIds.length, subIds: createdIds });
+    }
+
+    res.json({ success: true, message: `Processed ${contracts.length} contracts`, results });
+  } catch (e) {
+    console.error('[seed-subscriptions] Error:', e.response?.data || e.message);
+    res.status(500).json({ success: false, message: e.response?.data?.message || e.message });
   }
 });
 
