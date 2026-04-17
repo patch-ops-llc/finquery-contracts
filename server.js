@@ -1025,7 +1025,6 @@ app.get('/api/start-amendment', async (req, res) => {
     const dealProps = {
       dealname: dealName,
       dealstage: 'appointmentscheduled',
-      deal_category: 'amendment',
       contract_start_date: startDate || fmtDateForHS(new Date()),
       contract_end_date: props.end_date || null,
       pipeline: 'default',
