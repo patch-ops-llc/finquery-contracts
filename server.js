@@ -155,8 +155,29 @@ const CONTRACT_SCHEMA = {
     { name: 'billing_postal_code', label: 'Billing Zip/Postal Code', type: 'string', fieldType: 'text' },
     { name: 'billing_country', label: 'Billing Country', type: 'string', fieldType: 'text' },
 
+    // ── Flags ─────────────────────────────────────────────────────────────
+    {
+      name: 'has_legacy_products', label: 'Has Legacy Products', type: 'enumeration', fieldType: 'booleancheckbox',
+      options: [{ label: 'Yes', value: 'true' }, { label: 'No', value: 'false' }],
+    },
+
     // ── Special terms / notes ────────────────────────────────────────────
     { name: 'special_terms', label: 'Special Terms', type: 'string', fieldType: 'textarea' },
+
+    // ── Auto-Renewal ─────────────────────────────────────────────────────
+    {
+      name: 'auto_renewal_enabled', label: 'Auto-Renewal Enabled', type: 'enumeration', fieldType: 'booleancheckbox',
+      options: [{ label: 'Yes', value: 'true' }, { label: 'No', value: 'false' }],
+    },
+    { name: 'auto_renewal_date', label: 'Auto-Renewal Date', type: 'date', fieldType: 'date' },
+    {
+      name: 'auto_renewal_released', label: 'Auto-Renewal Released', type: 'enumeration', fieldType: 'booleancheckbox',
+      options: [{ label: 'Yes', value: 'true' }, { label: 'No', value: 'false' }],
+    },
+
+    // ── Contract lineage ────────────────────────────────────────────────
+    { name: 'replaced_by_contract', label: 'Replaced By Contract ID', type: 'string', fieldType: 'text' },
+    { name: 'replaces_contract', label: 'Replaces Contract ID', type: 'string', fieldType: 'text' },
 
     // ── Integration ──────────────────────────────────────────────────────
     { name: 'netsuite_id', label: 'NetSuite ID', type: 'string', fieldType: 'text' },
@@ -226,6 +247,7 @@ const SUBSCRIPTION_SCHEMA = {
         { label: 'Active', value: 'active' },
         { label: 'Future', value: 'future' },
         { label: 'Inactive', value: 'inactive' },
+        { label: 'Expired', value: 'expired' },
         { label: 'Terminated', value: 'terminated' },
       ],
     },
@@ -238,6 +260,16 @@ const SUBSCRIPTION_SCHEMA = {
       ],
     },
     { name: 'amendment_indicator', label: 'Amendment Indicator', type: 'string', fieldType: 'text' },
+    {
+      name: 'revenue_type', label: 'Revenue Type', type: 'enumeration', fieldType: 'select',
+      options: [
+        { label: 'New', value: 'new' },
+        { label: 'Renewal', value: 'renewal' },
+        { label: 'Expansion', value: 'expansion' },
+        { label: 'Contraction', value: 'contraction' },
+        { label: 'Cross-Sell', value: 'cross_sell' },
+      ],
+    },
     {
       name: 'bundled', label: 'Bundled', type: 'enumeration', fieldType: 'booleancheckbox',
       options: [{ label: 'Yes', value: 'true' }, { label: 'No', value: 'false' }],
@@ -329,12 +361,24 @@ const DEAL_PROPERTIES = [
     options: [
       { label: 'New Business', value: 'new_business' },
       { label: 'Renewal', value: 'renewal' },
+      { label: 'Amendment', value: 'amendment' },
       { label: 'Expansion', value: 'expansion' },
       { label: 'Contraction', value: 'contraction' },
     ],
   },
   { name: 'contract_start_date', label: 'Contract Start Date', type: 'date', fieldType: 'date', groupName: 'dealinformation' },
   { name: 'contract_end_date', label: 'Contract End Date', type: 'date', fieldType: 'date', groupName: 'dealinformation' },
+  {
+    name: 'revenue_type', label: 'Revenue Type', type: 'enumeration', fieldType: 'select',
+    groupName: 'dealinformation',
+    options: [
+      { label: 'New', value: 'new' },
+      { label: 'Renewal', value: 'renewal' },
+      { label: 'Expansion', value: 'expansion' },
+      { label: 'Contraction', value: 'contraction' },
+      { label: 'Cross-Sell', value: 'cross_sell' },
+    ],
+  },
 ];
 
 // ── CRM helpers ──────────────────────────────────────────────────────────────
@@ -357,14 +401,17 @@ const CONTRACT_PROPS = [
   'portfolio_management_hours',
   'activated_by', 'renewal_owner', 'amendment_owner',
   'billing_street', 'billing_city', 'billing_state', 'billing_postal_code', 'billing_country',
+  'has_legacy_products',
+  'replaced_by_contract', 'replaces_contract',
   'special_terms', 'netsuite_id', 'contract_data',
+  'auto_renewal_enabled', 'auto_renewal_date', 'auto_renewal_released',
 ];
 
 const SUBSCRIPTION_PROPS = [
   'segment_name', 'sf_subscription_id', 'subscription_number',
   'product_code', 'product_name', 'product_subscription_type',
   'subscription_type', 'charge_type', 'billing_frequency',
-  'status', 'proration_status', 'amendment_indicator', 'bundled',
+  'status', 'proration_status', 'amendment_indicator', 'revenue_type', 'bundled',
   'start_date', 'end_date', 'subscription_start_date', 'subscription_end_date',
   'arr_start_date', 'arr_end_date', 'terminated_date', 'renewed_date',
   'segment_year', 'segment_label', 'segment_index', 'segment_key',
@@ -388,8 +435,10 @@ async function getObject(typeId, objectId, properties) {
   return data;
 }
 
-async function createObject(typeId, properties) {
-  const { data } = await hs.post(`/crm/v3/objects/${typeId}`, { properties });
+async function createObject(typeId, properties, associations) {
+  const body = { properties };
+  if (associations) body.associations = associations;
+  const { data } = await hs.post(`/crm/v3/objects/${typeId}`, body);
   return data;
 }
 
@@ -430,9 +479,9 @@ function determineStatus(startDate, endDate) {
   if (end) end.setHours(0, 0, 0, 0);
 
   if (start && start > now) return 'future';
-  if (end && end < now) return 'inactive';
+  if (end && end < now) return 'expired';
   if (start && start <= now && (!end || end >= now)) return 'active';
-  return 'inactive';
+  return 'expired';
 }
 
 function calcMetrics(subscriptions) {
@@ -449,6 +498,188 @@ function calcMetrics(subscriptions) {
     if (code === 'FCM') metrics.fcm_arr += arr;
   }
   return metrics;
+}
+
+function mapBillingFrequencyToRecurringPeriod(subscription) {
+  const sp = subscription.properties || {};
+  const billingFrequency = (sp.billing_frequency || '').toLowerCase();
+  if (billingFrequency === 'monthly') return 'P1M';
+  if (billingFrequency === 'quarterly') return 'P3M';
+  if (billingFrequency === 'semiannual') return 'P6M';
+  if (billingFrequency === 'annual') return 'P12M';
+  return 'P12M';
+}
+
+function normalizeLineRevenueType(rawRevenueType, fallback = 'renewal') {
+  const value = (rawRevenueType || '').toLowerCase();
+  if (['new', 'renewal', 'expansion', 'contraction', 'cross_sell'].includes(value)) {
+    return value;
+  }
+  return fallback;
+}
+
+const INHERITED_LINE_MARKER = 'FQ_INHERITED_SOURCE_LINE:';
+
+function parseInheritedSourceLineId(description) {
+  const text = String(description || '');
+  const match = text.match(/FQ_INHERITED_SOURCE_LINE:(\d+)/i);
+  if (!match) return null;
+  return match[1];
+}
+
+function buildInheritedDescription(baseDescription, sourceLineId) {
+  const base = String(baseDescription || '').replace(/\s*\|\s*FQ_INHERITED_SOURCE_LINE:\d+\s*$/i, '').trim();
+  return `${base ? `${base} | ` : ''}${INHERITED_LINE_MARKER}${sourceLineId}`;
+}
+
+function normalizeRecurringPeriod(periodRaw) {
+  const period = String(periodRaw || '').trim();
+  if (!period) return 'P12M';
+  const lower = period.toLowerCase();
+  if (lower === 'one_time' || lower === 'onetime') return null;
+  if (lower === 'annual') return 'P12M';
+  return period;
+}
+
+function stripUnsupportedLineItemProps(err, properties) {
+  const message = JSON.stringify(err?.response?.data || err?.message || '').toLowerCase();
+  const nextProps = { ...properties };
+  let changed = false;
+
+  if (message.includes('revenue_type') && Object.prototype.hasOwnProperty.call(nextProps, 'revenue_type')) {
+    delete nextProps.revenue_type;
+    changed = true;
+  }
+
+  if (
+    message.includes('hs_recurring_billing_start_date') &&
+    Object.prototype.hasOwnProperty.call(nextProps, 'hs_recurring_billing_start_date')
+  ) {
+    delete nextProps.hs_recurring_billing_start_date;
+    changed = true;
+  }
+
+  return changed ? nextProps : null;
+}
+
+async function createDealLineItemWithFallback(dealId, properties) {
+  try {
+    return await createObject('line_items', properties, [{
+      to: { id: dealId },
+      types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 20 }],
+    }]);
+  } catch (e) {
+    const fallbackProps = stripUnsupportedLineItemProps(e, properties);
+    if (!fallbackProps) throw e;
+    return createObject('line_items', fallbackProps, [{
+      to: { id: dealId },
+      types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 20 }],
+    }]);
+  }
+}
+
+async function updateLineItemWithFallback(lineItemId, properties) {
+  try {
+    return await updateObject('line_items', lineItemId, properties);
+  } catch (e) {
+    const fallbackProps = stripUnsupportedLineItemProps(e, properties);
+    if (!fallbackProps) throw e;
+    return updateObject('line_items', lineItemId, fallbackProps);
+  }
+}
+
+async function syncContractRecurringLineItemsToDeal(contractId, dealId, options = {}) {
+  const { fallbackRevenueType = 'renewal' } = options;
+
+  const sourceLineItemIds = await getAssociatedIds(contractTypeId, contractId, 'line_items');
+  const sourceItems = sourceLineItemIds.length === 0
+    ? []
+    : await Promise.all(
+      sourceLineItemIds.map((id) =>
+        getObject('line_items', id, [
+          'name', 'quantity', 'price', 'hs_sku', 'description',
+          'hs_recurring_billing_period', 'revenue_type',
+        ])
+      )
+    );
+
+  const recurringSourceItems = sourceItems.filter((item) => {
+    const period = normalizeRecurringPeriod(item?.properties?.hs_recurring_billing_period);
+    return !!period;
+  });
+
+  const dealLineItemIds = await getAssociatedIds('0-3', dealId, 'line_items');
+  const dealItems = dealLineItemIds.length === 0
+    ? []
+    : await Promise.all(
+      dealLineItemIds.map((id) =>
+        getObject('line_items', id, ['description'])
+      )
+    );
+
+  const existingBySourceLineId = {};
+  for (const item of dealItems) {
+    const sourceLineId = parseInheritedSourceLineId(item?.properties?.description);
+    if (!sourceLineId) continue;
+    existingBySourceLineId[sourceLineId] = item;
+  }
+
+  let created = 0;
+  let updated = 0;
+  let removed = 0;
+  const warnings = [];
+
+  const sourceIdSet = new Set();
+
+  for (const sourceItem of recurringSourceItems) {
+    const sourceLineId = String(sourceItem.id);
+    sourceIdSet.add(sourceLineId);
+    const props = sourceItem.properties || {};
+    const period = normalizeRecurringPeriod(props.hs_recurring_billing_period) || 'P12M';
+    const lineProps = {
+      name: props.name || 'Product',
+      quantity: String(parseInt(props.quantity, 10) || 1),
+      price: String(parseFloat(props.price) || 0),
+      hs_sku: props.hs_sku || '',
+      description: buildInheritedDescription(props.description, sourceLineId),
+      hs_recurring_billing_period: period,
+      revenue_type: normalizeLineRevenueType(props.revenue_type, fallbackRevenueType),
+    };
+
+    try {
+      const existing = existingBySourceLineId[sourceLineId];
+      if (existing?.id) {
+        await updateLineItemWithFallback(existing.id, lineProps);
+        updated++;
+      } else {
+        await createDealLineItemWithFallback(dealId, lineProps);
+        created++;
+      }
+    } catch (e) {
+      const lineName = props.name || sourceLineId;
+      warnings.push(`Failed syncing ${lineName}`);
+      console.warn('[sync-contract-lines] Failed line sync:', lineName, e.response?.data?.message || e.message);
+    }
+  }
+
+  for (const [sourceLineId, existing] of Object.entries(existingBySourceLineId)) {
+    if (sourceIdSet.has(sourceLineId)) continue;
+    try {
+      await hs.delete(`/crm/v3/objects/line_items/${existing.id}`);
+      removed++;
+    } catch (e) {
+      warnings.push(`Failed deleting stale inherited line ${existing.id}`);
+      console.warn('[sync-contract-lines] Failed deleting stale line item:', existing.id, e.response?.data?.message || e.message);
+    }
+  }
+
+  return {
+    sourceRecurringCount: recurringSourceItems.length,
+    lineItemsCreated: created,
+    lineItemsUpdated: updated,
+    lineItemsRemoved: removed,
+    warnings,
+  };
 }
 
 // ── Self-healing setup ───────────────────────────────────────────────────────
@@ -518,15 +749,106 @@ async function ensureSetup() {
     }
   }
 
+  // Ensure auto-renewal properties exist on contract schema (for existing deployments)
+  if (contractTypeId) {
+    const autoRenewalProps = [
+      { name: 'auto_renewal_enabled', label: 'Auto-Renewal Enabled', type: 'enumeration', fieldType: 'booleancheckbox',
+        options: [{ label: 'Yes', value: 'true' }, { label: 'No', value: 'false' }] },
+      { name: 'auto_renewal_date', label: 'Auto-Renewal Date', type: 'date', fieldType: 'date' },
+      { name: 'auto_renewal_released', label: 'Auto-Renewal Released', type: 'enumeration', fieldType: 'booleancheckbox',
+        options: [{ label: 'Yes', value: 'true' }, { label: 'No', value: 'false' }] },
+    ];
+    for (const prop of autoRenewalProps) {
+      try {
+        await hs.post(`/crm/v3/properties/${contractTypeId}`, prop);
+        console.log(`[ensureSetup] Created auto-renewal property: ${prop.name}`);
+      } catch (e) {
+        if (e.response?.status === 409 || e.response?.status === 400) continue;
+      }
+    }
+  }
+
   console.log(`[ensureSetup] Ready — contract=${contractTypeId}, subscription=${subscriptionTypeId}`);
   return { contractTypeId, subscriptionTypeId, productRegistry: PRODUCT_REGISTRY };
 }
 
 // ── Route: Health ────────────────────────────────────────────────────────────
 
-app.get('/', (req, res) => res.json({ status: 'ok', service: 'finquery-contracts-api' }));
+const API_VERSION = '2026-04-08a';
 
-app.get('/api/health', (req, res) => res.json({ status: 'ok', contractTypeId, subscriptionTypeId }));
+app.get('/', (req, res) => res.json({ status: 'ok', service: 'finquery-contracts-api', version: API_VERSION }));
+
+app.get('/api/health', (req, res) => res.json({ status: 'ok', version: API_VERSION, contractTypeId, subscriptionTypeId }));
+
+// ── Route: Test Line Item Creation ───────────────────────────────────────────
+
+app.get('/api/test-line-item', async (req, res) => {
+  try {
+    const { dealId, contractId } = req.query;
+    if (!dealId && !contractId) {
+      return res.status(400).json({ success: false, message: 'dealId or contractId required' });
+    }
+
+    await resolveTypeIds();
+
+    if (contractId && subscriptionTypeId) {
+      const subIds = await getAssociatedIds(contractTypeId, contractId, subscriptionTypeId);
+      const subs = [];
+      for (const sid of subIds) {
+        try {
+          const sub = await getObject(subscriptionTypeId, sid, SUBSCRIPTION_PROPS);
+          subs.push({
+            id: sub.id,
+            name: sub.properties?.segment_name,
+            product: sub.properties?.product_name,
+            productCode: sub.properties?.product_code,
+            status: sub.properties?.status,
+            quantity: sub.properties?.quantity,
+            unitPrice: sub.properties?.unit_price,
+            arr: sub.properties?.arr,
+          });
+        } catch (e) {
+          subs.push({ id: sid, error: e.message });
+        }
+      }
+      const activeSubs = subs.filter((s) => s.status === 'active');
+      return res.json({
+        success: true,
+        contractId,
+        totalSegments: subs.length,
+        activeSegments: activeSubs.length,
+        segments: subs,
+        note: dealId
+          ? 'Pass dealId to also test creating a line item on that deal'
+          : 'Add &dealId=X to test creating a line item on a specific deal',
+      });
+    }
+
+    if (dealId) {
+      try {
+        const lineItem = await createObject('line_items', {
+          name: 'TEST — Delete Me',
+          quantity: '1',
+          price: '0',
+        }, [{
+          to: { id: dealId },
+          types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 20 }],
+        }]);
+        return res.json({ success: true, message: 'Test line item created', lineItemId: lineItem.id, dealId });
+      } catch (e) {
+        return res.json({
+          success: false,
+          message: 'Line item creation failed',
+          error: e.response?.data || e.message,
+        });
+      }
+    }
+
+    res.json({ success: false, message: 'No action taken' });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message, detail: e.response?.data });
+  }
+});
 
 // ── Route: Ensure Setup ──────────────────────────────────────────────────────
 
@@ -626,20 +948,20 @@ app.get('/api/load-contract', async (req, res) => {
 
 app.get('/api/start-amendment', async (req, res) => {
   try {
-    const { contractId, amendmentType, startDate } = req.query;
-    if (!contractId || !amendmentType) {
-      return res.status(400).json({ success: false, message: 'contractId and amendmentType required' });
+    const { contractId, startDate } = req.query;
+    if (!contractId) {
+      return res.status(400).json({ success: false, message: 'contractId required' });
     }
 
     await resolveTypeIds();
     const contract = await getObject(contractTypeId, contractId, CONTRACT_PROPS);
     const props = contract.properties;
-    const dealName = `${props.contract_name || 'Contract'} — ${amendmentType === 'expansion' ? 'Expansion' : 'Contraction'} Amendment`;
+    const dealName = `${props.contract_name || 'Contract'} — Amendment`;
 
     const dealProps = {
       dealname: dealName,
       dealstage: 'appointmentscheduled',
-      deal_category: amendmentType,
+      deal_category: 'amendment',
       contract_start_date: startDate || fmtDateForHS(new Date()),
       contract_end_date: props.end_date || null,
       pipeline: 'default',
@@ -679,6 +1001,18 @@ app.get('/api/start-amendment', async (req, res) => {
       warnings.push(`${contactIds.length - contactsLinked} of ${contactIds.length} contact associations failed (likely deleted contacts)`);
     }
 
+    // Always seed from current contract recurring line items for contract-origin deals.
+    const seeded = await syncContractRecurringLineItemsToDeal(contractId, deal.id, {
+      fallbackRevenueType: 'renewal',
+    });
+    const lineItemsInherited = seeded.lineItemsCreated + seeded.lineItemsUpdated;
+    if (seeded.warnings?.length) warnings.push(...seeded.warnings);
+    console.log(
+      `[start-amendment] Synced recurring lines from contract ${contractId}: ` +
+      `${seeded.lineItemsCreated} created, ${seeded.lineItemsUpdated} updated, ${seeded.lineItemsRemoved} removed ` +
+      `(source recurring: ${seeded.sourceRecurringCount})`
+    );
+
     const amendCount = (parseInt(props.amendment_count) || 0) + 1;
     await updateObject(contractTypeId, contractId, {
       amendment_count: String(amendCount),
@@ -686,10 +1020,11 @@ app.get('/api/start-amendment', async (req, res) => {
 
     res.json({
       success: true,
-      message: `${amendmentType === 'expansion' ? 'Expansion' : 'Contraction'} amendment deal created`,
+      message: `Amendment deal created${lineItemsInherited > 0 ? ` with ${lineItemsInherited} inherited line items` : ''}`,
       dealId: deal.id,
       dealName,
       contactsLinked,
+      lineItemsInherited,
       warnings: warnings.length > 0 ? warnings : undefined,
     });
   } catch (e) {
@@ -837,16 +1172,229 @@ app.get('/api/create-renewal-deal', async (req, res) => {
       warnings.push(`${contactIds.length - contactsLinked} of ${contactIds.length} contact associations failed (likely deleted contacts)`);
     }
 
+    // Always seed from current contract recurring line items for contract-origin deals.
+    const seeded = await syncContractRecurringLineItemsToDeal(contractId, deal.id, {
+      fallbackRevenueType: 'renewal',
+    });
+    const lineItemsCreated = seeded.lineItemsCreated + seeded.lineItemsUpdated;
+    if (seeded.warnings?.length) warnings.push(...seeded.warnings);
+    console.log(
+      `[create-renewal] Synced recurring lines from contract ${contractId}: ` +
+      `${seeded.lineItemsCreated} created, ${seeded.lineItemsUpdated} updated, ${seeded.lineItemsRemoved} removed ` +
+      `(source recurring: ${seeded.sourceRecurringCount})`
+    );
+
     res.json({
       success: true,
       message: `Renewal deal created: ${fmtDateForHS(renewalStart)} → ${fmtDateForHS(renewalEnd)}`,
       dealId: deal.id,
       dealName,
       contactsLinked,
+      lineItemsCreated,
       warnings: warnings.length > 0 ? warnings : undefined,
     });
   } catch (e) {
     console.error('[create-renewal-deal] Error:', e.response?.data || e.message);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ── Route: Set Auto-Renewal ──────────────────────────────────────────────────
+
+app.get('/api/set-auto-renewal', async (req, res) => {
+  try {
+    const { contractId, enabled, date } = req.query;
+    if (!contractId) return res.status(400).json({ success: false, message: 'contractId required' });
+
+    await resolveTypeIds();
+
+    const updates = {};
+    if (enabled !== undefined) {
+      updates.auto_renewal_enabled = enabled === 'true' ? 'true' : 'false';
+    }
+    if (date) {
+      updates.auto_renewal_date = date;
+    }
+    if (enabled === 'true') {
+      updates.auto_renewal_released = 'false';
+    }
+
+    await updateObject(contractTypeId, contractId, updates);
+
+    res.json({
+      success: true,
+      message: enabled === 'true'
+        ? `Auto-renewal armed for ${date || 'contract end date'}`
+        : 'Auto-renewal disabled',
+    });
+  } catch (e) {
+    console.error('[set-auto-renewal] Error:', e.response?.data || e.message);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ── Route: Trigger Auto-Renewal ──────────────────────────────────────────────
+
+app.get('/api/trigger-auto-renewal', async (req, res) => {
+  try {
+    const { contractId } = req.query;
+    if (!contractId) return res.status(400).json({ success: false, message: 'contractId required' });
+
+    await resolveTypeIds();
+    const contract = await getObject(contractTypeId, contractId, CONTRACT_PROPS);
+    const props = contract.properties;
+
+    if (props.auto_renewal_released === 'true') {
+      return res.json({ success: true, message: 'Auto-renewal already released', alreadyReleased: true });
+    }
+
+    const currentEnd = props.end_date ? new Date(props.end_date) : new Date();
+    const renewalStart = new Date(currentEnd);
+    renewalStart.setDate(renewalStart.getDate() + 1);
+    const renewalEnd = new Date(renewalStart);
+    renewalEnd.setFullYear(renewalEnd.getFullYear() + 1);
+
+    const dealName = `${props.contract_name || 'Contract'} — Auto-Renewal`;
+
+    const deal = await createObject('0-3', {
+      dealname: dealName,
+      dealstage: 'appointmentscheduled',
+      deal_category: 'renewal',
+      contract_start_date: fmtDateForHS(renewalStart),
+      contract_end_date: fmtDateForHS(renewalEnd),
+      amount: props.total_arr || '0',
+      pipeline: 'default',
+    });
+
+    const warnings = [];
+
+    const companyIds = await getAssociatedIds(contractTypeId, contractId, '0-2');
+    if (companyIds.length > 0) {
+      try { await createAssociation('0-3', deal.id, '0-2', companyIds[0]); }
+      catch (e) { warnings.push('Company association failed'); }
+    }
+
+    try { await createAssociation(contractTypeId, contractId, '0-3', deal.id); }
+    catch (e) { /* ok */ }
+
+    const contactIds = await getAssociatedIds(contractTypeId, contractId, '0-1');
+    let contactsLinked = 0;
+    for (const cid of contactIds) {
+      try { await createAssociation('0-3', deal.id, '0-1', cid); contactsLinked++; }
+      catch (e) { /* skip invalid */ }
+    }
+
+    const seeded = await syncContractRecurringLineItemsToDeal(contractId, deal.id, {
+      fallbackRevenueType: 'renewal',
+    });
+    const lineItemsCreated = seeded.lineItemsCreated + seeded.lineItemsUpdated;
+    if (seeded.warnings?.length) warnings.push(...seeded.warnings);
+
+    await updateObject(contractTypeId, contractId, {
+      auto_renewal_released: 'true',
+    });
+
+    console.log(
+      `[trigger-auto-renewal] Released for contract ${contractId}: deal ${deal.id}, ` +
+      `${seeded.lineItemsCreated} created, ${seeded.lineItemsUpdated} updated, ${seeded.lineItemsRemoved} removed`
+    );
+
+    res.json({
+      success: true,
+      message: `Auto-renewal deal created: ${fmtDateForHS(renewalStart)} → ${fmtDateForHS(renewalEnd)}`,
+      dealId: deal.id,
+      dealName,
+      contactsLinked,
+      lineItemsCreated,
+      warnings: warnings.length > 0 ? warnings : undefined,
+    });
+  } catch (e) {
+    console.error('[trigger-auto-renewal] Error:', e.response?.data || e.message);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ── Route: Check Auto-Renewals (batch) ───────────────────────────────────────
+
+app.get('/api/check-auto-renewals', async (req, res) => {
+  try {
+    await resolveTypeIds();
+    if (!contractTypeId) return res.status(500).json({ success: false, message: 'Contract schema not found' });
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const { data } = await hs.post(`/crm/v3/objects/${contractTypeId}/search`, {
+      filterGroups: [{
+        filters: [
+          { propertyName: 'auto_renewal_enabled', operator: 'EQ', value: 'true' },
+          { propertyName: 'auto_renewal_date', operator: 'LTE', value: String(today.valueOf()) },
+          { propertyName: 'status', operator: 'IN', values: ['active', 'future'] },
+        ],
+      }],
+      properties: ['contract_name', 'auto_renewal_date', 'auto_renewal_released', 'status', 'end_date', 'total_arr'],
+      limit: 100,
+    });
+
+    const candidates = (data.results || []).filter(
+      (c) => c.properties.auto_renewal_released !== 'true'
+    );
+
+    const results = [];
+    for (const c of candidates) {
+      try {
+        const cp = c.properties;
+        const currentEnd = cp.end_date ? new Date(cp.end_date) : new Date();
+        const renewalStart = new Date(currentEnd);
+        renewalStart.setDate(renewalStart.getDate() + 1);
+        const renewalEnd = new Date(renewalStart);
+        renewalEnd.setFullYear(renewalEnd.getFullYear() + 1);
+
+        const dealName = `${cp.contract_name || 'Contract'} — Auto-Renewal`;
+        const deal = await createObject('0-3', {
+          dealname: dealName,
+          dealstage: 'appointmentscheduled',
+          deal_category: 'renewal',
+          contract_start_date: fmtDateForHS(renewalStart),
+          contract_end_date: fmtDateForHS(renewalEnd),
+          amount: cp.total_arr || '0',
+          pipeline: 'default',
+        });
+
+        try { await createAssociation(contractTypeId, c.id, '0-3', deal.id); } catch (e) { /* ok */ }
+        const companyIds = await getAssociatedIds(contractTypeId, c.id, '0-2');
+        if (companyIds.length > 0) {
+          try { await createAssociation('0-3', deal.id, '0-2', companyIds[0]); } catch (e) { /* ok */ }
+        }
+
+        const seeded = await syncContractRecurringLineItemsToDeal(c.id, deal.id, {
+          fallbackRevenueType: 'renewal',
+        });
+
+        await updateObject(contractTypeId, c.id, { auto_renewal_released: 'true' });
+
+        results.push({
+          contractId: c.id,
+          name: cp.contract_name,
+          dealId: deal.id,
+          dealName,
+          lineItemsSynced: seeded.lineItemsCreated + seeded.lineItemsUpdated,
+          status: 'released',
+        });
+        console.log(`[check-auto-renewals] Released: ${cp.contract_name} → deal ${deal.id}`);
+      } catch (e) {
+        results.push({ contractId: c.id, name: c.properties.contract_name, error: e.message });
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `Processed ${results.length} auto-renewal(s)`,
+      processed: results.length,
+      results,
+    });
+  } catch (e) {
+    console.error('[check-auto-renewals] Error:', e.response?.data || e.message);
     res.status(500).json({ success: false, message: e.message });
   }
 });
@@ -974,6 +1522,113 @@ app.get('/api/load-account-rollups', async (req, res) => {
   }
 });
 
+// ── Route: Load Company Contracts ────────────────────────────────────────────
+
+app.get('/api/load-company-contracts', async (req, res) => {
+  try {
+    const { companyId } = req.query;
+    if (!companyId) return res.status(400).json({ success: false, message: 'companyId required' });
+
+    await resolveTypeIds();
+    if (!contractTypeId) return res.status(500).json({ success: false, message: 'Contract schema not found' });
+
+    let companyName = '';
+    try {
+      const company = await getObject('0-2', companyId, ['name']);
+      companyName = company.properties?.name || '';
+    } catch (e) { /* non-critical */ }
+
+    const contractIds = await getAssociatedIds('0-2', companyId, contractTypeId);
+
+    let totalArr = 0;
+    let totalMrr = 0;
+    let totalTcv = 0;
+    let ltv = 0;
+    let activeContracts = 0;
+    let lqArr = 0;
+    let fcmArr = 0;
+    const contracts = [];
+
+    for (const cid of contractIds) {
+      try {
+        const c = await getObject(contractTypeId, cid, CONTRACT_PROPS);
+        const cp = c.properties;
+        const arr = parseFloat(cp.total_arr) || 0;
+        const tcv = parseFloat(cp.total_tcv) || 0;
+        const mrr = arr / 12;
+
+        ltv += tcv;
+
+        if (cp.status === 'active') {
+          activeContracts++;
+          totalArr += arr;
+          totalMrr += mrr;
+          totalTcv += tcv;
+          lqArr += parseFloat(cp.lq_arr) || 0;
+          fcmArr += parseFloat(cp.fcm_arr) || 0;
+        }
+
+        const products = [];
+        const lqA = parseFloat(cp.lq_arr) || 0;
+        const fcmA = parseFloat(cp.fcm_arr) || 0;
+        if (lqA > 0) products.push({ name: 'LeaseQuery', code: 'LQ', arr: lqA });
+        if (fcmA > 0) products.push({ name: 'FCM', code: 'FCM', arr: fcmA });
+
+        contracts.push({
+          id: c.id,
+          objectTypeId: contractTypeId,
+          name: cp.contract_name,
+          number: cp.contract_number,
+          status: cp.status,
+          arr,
+          mrr,
+          tcv,
+          startDate: cp.start_date,
+          endDate: cp.end_date,
+          coTermDate: cp.co_term_date,
+          term: parseInt(cp.contract_term) || null,
+          renewalTerm: parseInt(cp.renewal_term) || null,
+          evergreen: cp.evergreen,
+          renewalUplift: parseFloat(cp.renewal_uplift_rate) || 0,
+          subscriptionCount: parseInt(cp.subscription_count) || 0,
+          amendmentCount: parseInt(cp.amendment_count) || 0,
+          activatedDate: cp.activated_date,
+          terminatedDate: cp.terminated_date,
+          terminationReason: cp.termination_reason,
+          products,
+        });
+      } catch (e) {
+        console.warn(`[load-company-contracts] Skipping contract ${cid}:`, e.message);
+      }
+    }
+
+    let portalId = null;
+    try {
+      const { data: acct } = await hs.get('/account-info/v3/details');
+      portalId = acct.portalId;
+    } catch (e) { /* non-critical */ }
+
+    res.json({
+      success: true,
+      companyId,
+      companyName,
+      totalArr,
+      totalMrr,
+      totalTcv,
+      ltv,
+      lqArr,
+      fcmArr,
+      activeContracts,
+      totalContracts: contracts.length,
+      contracts,
+      portalId,
+    });
+  } catch (e) {
+    console.error('[load-company-contracts] Error:', e.response?.data || e.message);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 // ── Route: Load Deal CPQ ─────────────────────────────────────────────────────
 
 app.get('/api/load-deal-cpq', async (req, res) => {
@@ -1070,6 +1725,132 @@ app.get('/api/load-deal-cpq', async (req, res) => {
   }
 });
 
+// ── Route: Upsert Demo Deal Line Items by Year ───────────────────────────────
+
+app.post('/api/upsert-demo-line-items', async (req, res) => {
+  try {
+    const dealId = req.body?.dealId || req.query?.dealId;
+    const yearItems = Array.isArray(req.body?.yearItems) ? req.body.yearItems : [];
+
+    if (!dealId) {
+      return res.status(400).json({ success: false, message: 'dealId required' });
+    }
+
+    const normalizeRevenueType = (raw) => {
+      const value = String(raw || '').toLowerCase();
+      return value === 'expansion' ? 'expansion' : 'renewal';
+    };
+
+    const parseYearToken = (description) => {
+      const raw = String(description || '');
+      const match = raw.match(/FQ_DEMO_YEAR:(\d+)/i);
+      if (!match) return null;
+      const year = parseInt(match[1], 10);
+      return Number.isFinite(year) && year > 0 ? year : null;
+    };
+
+    const toPriceString = (value) => {
+      const n = Number(value);
+      if (!Number.isFinite(n) || n < 0) return '0';
+      return (Math.round(n * 100) / 100).toFixed(2);
+    };
+
+    const normalizedYears = yearItems
+      .map((item) => {
+        const year = parseInt(item?.year, 10);
+        if (!Number.isFinite(year) || year <= 0) return null;
+        return {
+          year,
+          netArr: Math.max(0, parseFloat(item?.netArr) || 0),
+          revenueType: normalizeRevenueType(item?.revenueType),
+          startDate: fmtDateForHS(item?.startDate),
+        };
+      })
+      .filter(Boolean);
+
+    const incomingYearSet = new Set(normalizedYears.map((item) => item.year));
+
+    const associatedIds = await getAssociatedIds('0-3', dealId, 'line_items');
+    const existingManagedByYear = {};
+
+    for (const lineItemId of associatedIds) {
+      try {
+        const lineItem = await getObject('line_items', lineItemId, [
+          'description',
+          'name',
+          'price',
+          'quantity',
+          'hs_sku',
+          'hs_recurring_billing_period',
+          'hs_recurring_billing_start_date',
+          'revenue_type',
+        ]);
+        const year = parseYearToken(lineItem?.properties?.description);
+        if (!year) continue;
+        existingManagedByYear[year] = lineItem;
+      } catch (e) {
+        console.warn('[upsert-demo-line-items] Failed to read line item', lineItemId, e.message);
+      }
+    }
+
+    let created = 0;
+    let updated = 0;
+    let removed = 0;
+    const lineItems = [];
+
+    for (const item of normalizedYears) {
+      const props = {
+        name: `Demo CPQ - Year ${item.year}`,
+        quantity: '1',
+        price: toPriceString(item.netArr),
+        hs_sku: `DEMO-Y${item.year}`,
+        hs_recurring_billing_period: 'P12M',
+        description: `FinQuery CPQ demo line item | FQ_DEMO_YEAR:${item.year}`,
+        revenue_type: item.revenueType,
+      };
+
+      if (item.startDate) {
+        props.hs_recurring_billing_start_date = item.startDate;
+      }
+
+      const existing = existingManagedByYear[item.year];
+      if (existing?.id) {
+        await updateLineItemWithFallback(existing.id, props);
+        updated++;
+        lineItems.push({ id: existing.id, year: item.year, ...props });
+      } else {
+        const createdItem = await createDealLineItemWithFallback(dealId, props);
+        created++;
+        lineItems.push({ id: createdItem.id, year: item.year, ...props });
+      }
+    }
+
+    for (const [yearKey, existing] of Object.entries(existingManagedByYear)) {
+      const year = parseInt(yearKey, 10);
+      if (incomingYearSet.has(year)) continue;
+      if (!existing?.id) continue;
+      try {
+        await hs.delete(`/crm/v3/objects/line_items/${existing.id}`);
+        removed++;
+      } catch (e) {
+        console.warn('[upsert-demo-line-items] Failed to delete stale demo line item', existing.id, e.message);
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `Demo line items synced (${created} created, ${updated} updated, ${removed} removed)`,
+      created,
+      updated,
+      removed,
+      lineItems,
+    });
+  } catch (e) {
+    console.error('[upsert-demo-line-items] Error:', e.response?.data || e.message);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 // ── Route: Update Contract from Deal (webhook) ──────────────────────────────
 
 app.post('/api/update-contract-from-deal', async (req, res) => {
@@ -1090,9 +1871,139 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
       return res.json({ success: true, message: 'Deal not closed-won — no action taken' });
     }
 
+    const category = dp.deal_category || 'new_business';
     const contractIds = await getAssociatedIds('0-3', dealId, contractTypeId);
 
-    if (contractIds.length === 0 && dp.deal_category === 'new_business') {
+    // ── Helper: read deal line items ─────────────────────────────────
+    async function getDealLineItems() {
+      const lineItemIds = await getAssociatedIds('0-3', dealId, 'line_items');
+      if (lineItemIds.length === 0) return [];
+      const items = await Promise.all(
+        lineItemIds.map((id) =>
+          getObject('line_items', id, [
+            'name', 'quantity', 'price', 'amount', 'hs_sku', 'description',
+            'hs_line_item_currency_code', 'hs_recurring_billing_period',
+            'hs_recurring_billing_start_date', 'revenue_type',
+          ])
+        )
+      );
+      return items;
+    }
+
+    function isRecurringLineItem(li) {
+      const lp = li.properties || {};
+      const period = (lp.hs_recurring_billing_period || '').toLowerCase();
+      return period && period !== 'one_time' && period !== 'onetime';
+    }
+
+    // ── Helper: create subscription segments from recurring line items ─
+    async function createSegmentsFromLineItems(cId, lineItems, opts = {}) {
+      const {
+        startDate,
+        endDate,
+        revenueType,
+        amendmentIndicator,
+        dealCategory,
+        companyId,
+      } = opts;
+
+      const recurringItems = lineItems.filter(isRecurringLineItem);
+      let created = 0;
+      let totalArr = 0;
+
+      for (const li of recurringItems) {
+        const lp = li.properties || {};
+        const qty = parseInt(lp.quantity) || 1;
+        const unitPrice = parseFloat(lp.price) || 0;
+        const lineArr = unitPrice * qty;
+        totalArr += lineArr;
+
+        const segProps = {
+          segment_name: lp.name || 'Product',
+          product_name: lp.name || 'Product',
+          product_code: lp.hs_sku || '',
+          quantity: String(qty),
+          unit_price: String(unitPrice),
+          arr: String(lineArr),
+          mrr: String(lineArr / 12),
+          tcv: String(lineArr),
+          status: determineStatus(startDate, endDate),
+          start_date: startDate,
+          end_date: endDate,
+          segment_year: '1',
+          segment_index: String(created),
+          segment_label: `Year 1`,
+          revenue_type: normalizeLineRevenueType(lp.revenue_type, revenueType || ''),
+        };
+
+        if (amendmentIndicator) {
+          let indicator = amendmentIndicator;
+          if (dealCategory === 'amendment') {
+            const lineRevType = normalizeLineRevenueType(lp.revenue_type, 'renewal');
+            if (lineRevType === 'expansion' || lineRevType === 'cross_sell' || lineRevType === 'new') {
+              indicator = 'Expansion';
+            } else if (lineRevType === 'contraction') {
+              indicator = 'Contraction';
+            } else {
+              indicator = 'Renewal';
+            }
+          }
+          // Per-line-item amendment indicator: on contraction deals, items tagged
+          // as expansion or cross-sell get "Expansion" instead of "Contraction"
+          if (dealCategory === 'contraction') {
+            const lineRevType = (lp.revenue_type || '').toLowerCase();
+            if (lineRevType === 'expansion' || lineRevType === 'cross_sell') {
+              indicator = 'Expansion';
+            }
+          }
+          segProps.amendment_indicator = indicator;
+        }
+
+        const seg = await createObject(subscriptionTypeId, segProps);
+        try { await createAssociation(subscriptionTypeId, seg.id, contractTypeId, cId); } catch (e) { /* ok */ }
+        if (companyId) {
+          try { await createAssociation(subscriptionTypeId, seg.id, '0-2', companyId); } catch (e) { /* ok */ }
+        }
+        created++;
+        console.log(`[update-contract] Created segment ${seg.id}: ${lp.name} x${qty} @ ${unitPrice}`);
+      }
+
+      const skippedOneTime = lineItems.length - recurringItems.length;
+      if (skippedOneTime > 0) {
+        console.log(`[update-contract] Skipped ${skippedOneTime} one-time line items (not subscription segments)`);
+      }
+
+      return { created, totalArr };
+    }
+
+    // ── Helper: copy ALL line items to contract ─────────────────────
+    async function copyLineItemsToContract(cId, lineItems) {
+      let created = 0;
+      for (const li of lineItems) {
+        const lp = li.properties || {};
+        try {
+          const contractLineItem = await createObject('line_items', {
+            name: lp.name || 'Product',
+            quantity: lp.quantity || '1',
+            price: lp.price || '0',
+            amount: lp.amount || '',
+            hs_sku: lp.hs_sku || '',
+            description: lp.description || '',
+            hs_recurring_billing_period: lp.hs_recurring_billing_period || '',
+            revenue_type: lp.revenue_type || '',
+          });
+          await createAssociation('line_items', contractLineItem.id, contractTypeId, cId);
+          created++;
+          console.log(`[update-contract] Copied line item to contract: ${lp.name} (${isRecurringLineItem(li) ? 'recurring' : 'one-time'})`);
+        } catch (e) {
+          console.warn(`[update-contract] Failed to copy line item ${lp.name} to contract:`, e.response?.data?.message || e.message);
+        }
+      }
+      return created;
+    }
+
+    // ═══ NEW BUSINESS ═══════════════════════════════════════════════════
+    if (contractIds.length === 0 && category === 'new_business') {
       const companyIds = await getAssociatedIds('0-3', dealId, '0-2');
       const startDate = dp.contract_start_date || fmtDateForHS(new Date());
       let endDate = dp.contract_end_date;
@@ -1102,6 +2013,8 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
         endDate = fmtDateForHS(ed);
       }
 
+      const lineItems = await getDealLineItems();
+
       const contract = await createObject(contractTypeId, {
         contract_name: dp.dealname.replace(' — New Business', '').replace(' - New Business', ''),
         status: determineStatus(startDate, endDate),
@@ -1110,35 +2023,235 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
         co_term_date: endDate,
         total_arr: dp.amount || '0',
         total_tcv: dp.amount || '0',
-        subscription_count: '0',
+        subscription_count: String(lineItems.length),
         amendment_count: '0',
       });
 
       try { await createAssociation(contractTypeId, contract.id, '0-3', dealId); } catch (e) { /* ok */ }
-      if (companyIds.length > 0) {
-        try { await createAssociation(contractTypeId, contract.id, '0-2', companyIds[0]); } catch (e) { /* ok */ }
+      const companyId = companyIds.length > 0 ? companyIds[0] : null;
+      if (companyId) {
+        try { await createAssociation(contractTypeId, contract.id, '0-2', companyId); } catch (e) { /* ok */ }
       }
 
-      return res.json({ success: true, message: 'New contract created from deal', contractId: contract.id });
-    }
+      let segmentsCreated = 0;
+      let contractLineItems = 0;
+      if (lineItems.length > 0) {
+        contractLineItems = await copyLineItemsToContract(contract.id, lineItems);
 
-    if (contractIds.length > 0) {
-      const cid = contractIds[0];
-      const updates = {};
+        if (subscriptionTypeId) {
+          const result = await createSegmentsFromLineItems(contract.id, lineItems, {
+            startDate,
+            endDate,
+            revenueType: 'new',
+            companyId,
+          });
+          segmentsCreated = result.created;
 
-      if (dp.deal_category === 'renewal') {
-        if (dp.contract_start_date) updates.start_date = dp.contract_start_date;
-        if (dp.contract_end_date) {
-          updates.end_date = dp.contract_end_date;
-          updates.co_term_date = dp.contract_end_date;
+          if (result.totalArr > 0) {
+            await updateObject(contractTypeId, contract.id, {
+              total_arr: String(result.totalArr),
+              total_tcv: String(result.totalArr),
+              subscription_count: String(segmentsCreated),
+            });
+          }
         }
       }
 
+      return res.json({
+        success: true,
+        message: `New contract created with ${segmentsCreated} subscription segments and ${contractLineItems} line items`,
+        contractId: contract.id,
+        segmentsCreated,
+        contractLineItems,
+      });
+    }
+
+    // ═══ EXISTING CONTRACT ═══════════════════════════════════════════════
+    if (contractIds.length > 0) {
+      const cid = contractIds[0];
       const contract = await getObject(contractTypeId, cid, CONTRACT_PROPS);
-      const newStatus = determineStatus(
-        updates.start_date || contract.properties.start_date,
-        updates.end_date || contract.properties.end_date
-      );
+      const cp = contract.properties;
+      const updates = {};
+
+      // ── RENEWAL — creates NEW contract, expires old one ───────────
+      if (category === 'renewal') {
+        const renewalStart = dp.contract_start_date || fmtDateForHS(new Date());
+        let renewalEnd = dp.contract_end_date;
+        if (!renewalEnd) {
+          const ed = new Date(renewalStart);
+          ed.setFullYear(ed.getFullYear() + 1);
+          renewalEnd = fmtDateForHS(ed);
+        }
+
+        const companyIds = await getAssociatedIds(contractTypeId, cid, '0-2');
+        const companyId = companyIds.length > 0 ? companyIds[0] : null;
+        const lineItems = await getDealLineItems();
+
+        // Create new contract for the renewal term
+        const contractName = (cp.contract_name || 'Contract').replace(/ — Renewal.*$/, '');
+        const newContract = await createObject(contractTypeId, {
+          contract_name: contractName,
+          status: determineStatus(renewalStart, renewalEnd),
+          start_date: renewalStart,
+          end_date: renewalEnd,
+          co_term_date: renewalEnd,
+          total_arr: dp.amount || cp.total_arr || '0',
+          total_tcv: dp.amount || cp.total_tcv || '0',
+          subscription_count: '0',
+          amendment_count: '0',
+          replaces_contract: cid,
+          contract_renewed_on: fmtDateForHS(new Date()),
+          has_legacy_products: cp.has_legacy_products || 'false',
+        });
+
+        // Associate new contract to deal, company, contacts
+        try { await createAssociation(contractTypeId, newContract.id, '0-3', dealId); } catch (e) { /* ok */ }
+        if (companyId) {
+          try { await createAssociation(contractTypeId, newContract.id, '0-2', companyId); } catch (e) { /* ok */ }
+        }
+        const contactIds = await getAssociatedIds(contractTypeId, cid, '0-1');
+        for (const contactId of contactIds) {
+          try { await createAssociation(contractTypeId, newContract.id, '0-1', contactId); } catch (e) { /* ok */ }
+        }
+
+        // Copy line items to new contract + create subscription segments
+        let contractLineItemsCopied = 0;
+        let segmentsCreated = 0;
+        if (lineItems.length > 0) {
+          contractLineItemsCopied = await copyLineItemsToContract(newContract.id, lineItems);
+
+          if (subscriptionTypeId) {
+            const result = await createSegmentsFromLineItems(newContract.id, lineItems, {
+              startDate: renewalStart,
+              endDate: renewalEnd,
+              revenueType: 'renewal',
+              companyId,
+            });
+            segmentsCreated = result.created;
+
+            if (result.totalArr > 0) {
+              await updateObject(contractTypeId, newContract.id, {
+                total_arr: String(result.totalArr),
+                total_tcv: String(result.totalArr),
+                subscription_count: String(segmentsCreated),
+              });
+            }
+          }
+        }
+
+        // Expire old contract and link to new
+        await updateObject(contractTypeId, cid, {
+          status: 'expired',
+          replaced_by_contract: newContract.id,
+          contract_renewed_on: fmtDateForHS(new Date()),
+        });
+
+        return res.json({
+          success: true,
+          message: `Renewal contract created: ${renewalStart} → ${renewalEnd} (${segmentsCreated} segments, ${contractLineItemsCopied} line items). Old contract ${cid} expired.`,
+          contractId: newContract.id,
+          oldContractId: cid,
+          segmentsCreated,
+          contractLineItems: contractLineItemsCopied,
+        });
+      }
+
+      // ── AMENDMENT / EXPANSION / CONTRACTION ──────────────────────────
+      if (category === 'amendment' || category === 'expansion' || category === 'contraction') {
+        const lineItems = await getDealLineItems();
+        const companyIds = await getAssociatedIds(contractTypeId, cid, '0-2');
+        const companyId = companyIds.length > 0 ? companyIds[0] : null;
+
+        const amendStartDate = dp.contract_start_date || cp.amendment_start_date || fmtDateForHS(new Date());
+        const amendEndDate = dp.contract_end_date || cp.end_date;
+
+        let segmentsCreated = 0;
+        let contractLineItemsCopied = 0;
+        let newTotalArr = 0;
+
+        if (lineItems.length > 0) {
+          // Amendment processing replaces contract line items with the deal's full post-amendment set
+          const existingLineItemIds = await getAssociatedIds(contractTypeId, cid, 'line_items');
+          for (const liId of existingLineItemIds) {
+            try {
+              await hs.delete(`/crm/v3/objects/line_items/${liId}`);
+            } catch (e) {
+              console.warn(`[update-contract] Failed to remove old line item ${liId}:`, e.response?.data?.message || e.message);
+            }
+          }
+          console.log(`[update-contract] Removed ${existingLineItemIds.length} existing line items from contract ${cid} before ${category} replacement`);
+
+          contractLineItemsCopied = await copyLineItemsToContract(cid, lineItems);
+
+          if (subscriptionTypeId) {
+            const result = await createSegmentsFromLineItems(cid, lineItems, {
+              startDate: amendStartDate,
+              endDate: amendEndDate,
+              revenueType: category === 'amendment' ? 'renewal' : category,
+              amendmentIndicator: category === 'expansion' ? 'Expansion' : (category === 'contraction' ? 'Contraction' : 'Renewal'),
+              dealCategory: category,
+              companyId,
+            });
+            segmentsCreated = result.created;
+            newTotalArr = result.totalArr;
+          }
+        }
+
+        const amendCount = parseInt(cp.amendment_count) || 0;
+        updates.amendment_count = String(amendCount + 1);
+        updates.amendment_start_date = amendStartDate;
+
+        // Recalculate metrics from all segments
+        const allSubIds = await getAssociatedIds(contractTypeId, cid, subscriptionTypeId);
+        if (allSubIds.length > 0) {
+          const allSubs = await Promise.all(allSubIds.map((id) => getObject(subscriptionTypeId, id, SUBSCRIPTION_PROPS)));
+          const metrics = calcMetrics(allSubs);
+          updates.total_arr = String(metrics.total_arr);
+          updates.total_tcv = String(metrics.total_tcv);
+          updates.lq_arr = String(metrics.lq_arr);
+          updates.fcm_arr = String(metrics.fcm_arr);
+          updates.subscription_count = String(metrics.subscription_count);
+          newTotalArr = metrics.total_arr;
+        }
+
+        updates.status = determineStatus(cp.start_date, cp.end_date);
+
+        // Auto-terminate if amendment results in zero ARR
+        if (newTotalArr <= 0 && (category === 'contraction' || category === 'amendment')) {
+          console.log(`[update-contract] Zero-ARR detected after ${category} — auto-terminating contract ${cid}`);
+          updates.status = 'terminated';
+          updates.terminated_date = fmtDateForHS(new Date());
+          updates.termination_reason = 'amendment';
+
+          // Terminate all segments
+          if (allSubIds && allSubIds.length > 0) {
+            for (const subId of allSubIds) {
+              try {
+                await updateObject(subscriptionTypeId, subId, {
+                  status: 'terminated',
+                  terminated_date: fmtDateForHS(new Date()),
+                });
+              } catch (e) { /* best-effort */ }
+            }
+          }
+        }
+
+        await updateObject(contractTypeId, cid, updates);
+
+        const terminated = updates.status === 'terminated';
+        return res.json({
+          success: true,
+          message: terminated
+            ? `Contract ${cid} auto-terminated (zero ARR after ${category})`
+            : `Contract ${cid} updated: ${segmentsCreated} segments added from ${category}`,
+          contractId: cid,
+          segmentsCreated,
+          autoTerminated: terminated,
+        });
+      }
+
+      // ── FALLBACK for other categories ────────────────────────────────
+      const newStatus = determineStatus(cp.start_date, cp.end_date);
       updates.status = newStatus;
 
       if (Object.keys(updates).length > 0) {
