@@ -519,6 +519,7 @@ function normalizeLineRevenueType(rawRevenueType, fallback = 'renewal') {
 }
 
 const INHERITED_LINE_MARKER = 'FQ_INHERITED_SOURCE_LINE:';
+const INHERITED_PRODUCT_MARKER = 'FQ_INHERITED_PRODUCT_KEY:';
 
 function parseInheritedSourceLineId(description) {
   const text = String(description || '');
@@ -527,9 +528,26 @@ function parseInheritedSourceLineId(description) {
   return match[1];
 }
 
-function buildInheritedDescription(baseDescription, sourceLineId) {
-  const base = String(baseDescription || '').replace(/\s*\|\s*FQ_INHERITED_SOURCE_LINE:\d+\s*$/i, '').trim();
-  return `${base ? `${base} | ` : ''}${INHERITED_LINE_MARKER}${sourceLineId}`;
+function parseInheritedProductKey(description) {
+  const text = String(description || '');
+  const match = text.match(/FQ_INHERITED_PRODUCT_KEY:([a-z0-9-]+)/i);
+  if (!match) return null;
+  return String(match[1]).toLowerCase();
+}
+
+function sanitizeProductKey(raw, fallback = 'product') {
+  return String(raw || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '') || fallback;
+}
+
+function buildInheritedProductDescription(baseDescription, productKey) {
+  const base = String(baseDescription || '')
+    .replace(/\s*\|\s*FQ_INHERITED_SOURCE_LINE:\d+\s*$/i, '')
+    .replace(/\s*\|\s*FQ_INHERITED_PRODUCT_KEY:[a-z0-9-]+\s*$/i, '')
+    .trim();
+  return `${base ? `${base} | ` : ''}${INHERITED_PRODUCT_MARKER}${productKey}`;
 }
 
 function normalizeRecurringPeriod(periodRaw) {
@@ -608,6 +626,43 @@ async function syncContractRecurringLineItemsToDeal(contractId, dealId, options 
     return !!period;
   });
 
+  const groupedByProduct = {};
+  recurringSourceItems.forEach((item, index) => {
+    const props = item.properties || {};
+    const sku = String(props.hs_sku || '').trim();
+    const name = String(props.name || 'Product').trim() || 'Product';
+    const key = sanitizeProductKey(sku || name, `product-${index + 1}`);
+    const qty = Math.max(0, parseFloat(props.quantity) || 0);
+    const quantity = qty > 0 ? qty : 1;
+    const unitPrice = Math.max(0, parseFloat(props.price) || 0);
+    const lineAmount = quantity * unitPrice;
+    const period = normalizeRecurringPeriod(props.hs_recurring_billing_period) || 'P12M';
+
+    if (!groupedByProduct[key]) {
+      groupedByProduct[key] = {
+        key,
+        name,
+        sku,
+        quantity: 0,
+        amount: 0,
+        period,
+        hasExpansion: false,
+      };
+    }
+
+    groupedByProduct[key].quantity += quantity;
+    groupedByProduct[key].amount += lineAmount;
+    if (!groupedByProduct[key].sku && sku) groupedByProduct[key].sku = sku;
+    if (period) groupedByProduct[key].period = period;
+
+    const revenueType = normalizeLineRevenueType(props.revenue_type, fallbackRevenueType);
+    if (revenueType === 'expansion' || revenueType === 'cross_sell' || revenueType === 'new') {
+      groupedByProduct[key].hasExpansion = true;
+    }
+  });
+
+  const groupedItems = Object.values(groupedByProduct);
+
   const dealLineItemIds = await getAssociatedIds('0-3', dealId, 'line_items');
   const dealItems = dealLineItemIds.length === 0
     ? []
@@ -617,11 +672,14 @@ async function syncContractRecurringLineItemsToDeal(contractId, dealId, options 
       )
     );
 
-  const existingBySourceLineId = {};
+  const existingByManagedKey = {};
   for (const item of dealItems) {
-    const sourceLineId = parseInheritedSourceLineId(item?.properties?.description);
-    if (!sourceLineId) continue;
-    existingBySourceLineId[sourceLineId] = item;
+    const desc = item?.properties?.description;
+    const productKey = parseInheritedProductKey(desc);
+    const sourceLineId = parseInheritedSourceLineId(desc);
+    const key = productKey || (sourceLineId ? `legacy-source-${sourceLineId}` : null);
+    if (!key) continue;
+    existingByManagedKey[key] = item;
   }
 
   let created = 0;
@@ -629,25 +687,31 @@ async function syncContractRecurringLineItemsToDeal(contractId, dealId, options 
   let removed = 0;
   const warnings = [];
 
-  const sourceIdSet = new Set();
+  const incomingKeySet = new Set();
 
-  for (const sourceItem of recurringSourceItems) {
-    const sourceLineId = String(sourceItem.id);
-    sourceIdSet.add(sourceLineId);
-    const props = sourceItem.properties || {};
-    const period = normalizeRecurringPeriod(props.hs_recurring_billing_period) || 'P12M';
+  groupedItems.forEach((item) => incomingKeySet.add(item.key));
+
+  const toPriceString = (value) => {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n < 0) return '0';
+    return (Math.round(n * 100) / 100).toFixed(2);
+  };
+
+  for (const item of groupedItems) {
+    const quantity = Math.max(1, Math.round(item.quantity || 0));
+    const unitPrice = quantity > 0 ? (item.amount / quantity) : item.amount;
     const lineProps = {
-      name: props.name || 'Product',
-      quantity: String(parseInt(props.quantity, 10) || 1),
-      price: String(parseFloat(props.price) || 0),
-      hs_sku: props.hs_sku || '',
-      description: buildInheritedDescription(props.description, sourceLineId),
-      hs_recurring_billing_period: period,
-      revenue_type: normalizeLineRevenueType(props.revenue_type, fallbackRevenueType),
+      name: item.name || 'Product',
+      quantity: String(quantity),
+      price: toPriceString(unitPrice),
+      hs_sku: item.sku || '',
+      description: buildInheritedProductDescription(item.name, item.key),
+      hs_recurring_billing_period: item.period || 'P12M',
+      revenue_type: item.hasExpansion ? 'expansion' : normalizeLineRevenueType('', fallbackRevenueType),
     };
 
     try {
-      const existing = existingBySourceLineId[sourceLineId];
+      const existing = existingByManagedKey[item.key];
       if (existing?.id) {
         await updateLineItemWithFallback(existing.id, lineProps);
         updated++;
@@ -656,14 +720,14 @@ async function syncContractRecurringLineItemsToDeal(contractId, dealId, options 
         created++;
       }
     } catch (e) {
-      const lineName = props.name || sourceLineId;
+      const lineName = item.name || item.key;
       warnings.push(`Failed syncing ${lineName}`);
       console.warn('[sync-contract-lines] Failed line sync:', lineName, e.response?.data?.message || e.message);
     }
   }
 
-  for (const [sourceLineId, existing] of Object.entries(existingBySourceLineId)) {
-    if (sourceIdSet.has(sourceLineId)) continue;
+  for (const [key, existing] of Object.entries(existingByManagedKey)) {
+    if (incomingKeySet.has(key)) continue;
     try {
       await hs.delete(`/crm/v3/objects/line_items/${existing.id}`);
       removed++;
@@ -1725,11 +1789,12 @@ app.get('/api/load-deal-cpq', async (req, res) => {
   }
 });
 
-// ── Route: Upsert Demo Deal Line Items by Year ───────────────────────────────
+// ── Route: Upsert Demo Deal Line Items by Product ────────────────────────────
 
 app.post('/api/upsert-demo-line-items', async (req, res) => {
   try {
     const dealId = req.body?.dealId || req.query?.dealId;
+    const productItems = Array.isArray(req.body?.productItems) ? req.body.productItems : [];
     const yearItems = Array.isArray(req.body?.yearItems) ? req.body.yearItems : [];
 
     if (!dealId) {
@@ -1749,29 +1814,74 @@ app.post('/api/upsert-demo-line-items', async (req, res) => {
       return Number.isFinite(year) && year > 0 ? year : null;
     };
 
+    const parseProductKeyToken = (description) => {
+      const raw = String(description || '');
+      const match = raw.match(/FQ_DEMO_PRODUCT_KEY:([a-z0-9-]+)/i);
+      if (!match) return null;
+      return String(match[1]).toLowerCase();
+    };
+
+    const sanitizeKey = (rawValue, fallback = 'product') =>
+      String(rawValue || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '') || fallback;
+
     const toPriceString = (value) => {
       const n = Number(value);
       if (!Number.isFinite(n) || n < 0) return '0';
       return (Math.round(n * 100) / 100).toFixed(2);
     };
 
-    const normalizedYears = yearItems
-      .map((item) => {
-        const year = parseInt(item?.year, 10);
-        if (!Number.isFinite(year) || year <= 0) return null;
+    const normalizedProducts = productItems
+      .map((item, index) => {
+        const key = sanitizeKey(
+          item?.key || item?.productCode || item?.productName,
+          `product-${index + 1}`
+        );
+        const quantity = Math.max(0, parseFloat(item?.quantity) || 0);
+        const netArr = Math.max(0, parseFloat(item?.netArr) || 0);
+        const unitPrice =
+          Math.max(0, parseFloat(item?.unitPrice)) ||
+          (quantity > 0 ? netArr / quantity : netArr);
+
         return {
-          year,
-          netArr: Math.max(0, parseFloat(item?.netArr) || 0),
+          key,
+          productCode: String(item?.productCode || '').trim(),
+          productName: String(item?.productName || '').trim() || 'Product',
+          quantity,
+          unitPrice,
+          netArr,
           revenueType: normalizeRevenueType(item?.revenueType),
           startDate: fmtDateForHS(item?.startDate),
         };
       })
       .filter(Boolean);
 
-    const incomingYearSet = new Set(normalizedYears.map((item) => item.year));
+    const normalizedYearsAsProducts = yearItems
+      .map((item) => {
+        const year = parseInt(item?.year, 10);
+        if (!Number.isFinite(year) || year <= 0) return null;
+        const netArr = Math.max(0, parseFloat(item?.netArr) || 0);
+        return {
+          key: `year-${year}`,
+          productCode: `DEMO-Y${year}`,
+          productName: `Year ${year}`,
+          quantity: 1,
+          unitPrice: netArr,
+          netArr,
+          revenueType: normalizeRevenueType(item?.revenueType),
+          startDate: fmtDateForHS(item?.startDate),
+        };
+      })
+      .filter(Boolean);
+
+    const normalizedItems = normalizedProducts.length > 0 ? normalizedProducts : normalizedYearsAsProducts;
+
+    const incomingKeySet = new Set(normalizedItems.map((item) => item.key));
 
     const associatedIds = await getAssociatedIds('0-3', dealId, 'line_items');
-    const existingManagedByYear = {};
+    const existingManagedByKey = {};
 
     for (const lineItemId of associatedIds) {
       try {
@@ -1785,9 +1895,11 @@ app.post('/api/upsert-demo-line-items', async (req, res) => {
           'hs_recurring_billing_start_date',
           'revenue_type',
         ]);
+        const productKey = parseProductKeyToken(lineItem?.properties?.description);
         const year = parseYearToken(lineItem?.properties?.description);
-        if (!year) continue;
-        existingManagedByYear[year] = lineItem;
+        const key = productKey || (year ? `year-${year}` : null);
+        if (!key) continue;
+        existingManagedByKey[key] = lineItem;
       } catch (e) {
         console.warn('[upsert-demo-line-items] Failed to read line item', lineItemId, e.message);
       }
@@ -1798,14 +1910,17 @@ app.post('/api/upsert-demo-line-items', async (req, res) => {
     let removed = 0;
     const lineItems = [];
 
-    for (const item of normalizedYears) {
+    for (const item of normalizedItems) {
+      const quantity = Math.max(0, parseFloat(item.quantity) || 0);
+      const unitPrice = Math.max(0, parseFloat(item.unitPrice) || 0);
+
       const props = {
-        name: `Demo CPQ - Year ${item.year}`,
-        quantity: '1',
-        price: toPriceString(item.netArr),
-        hs_sku: `DEMO-Y${item.year}`,
+        name: `Demo CPQ - ${item.productName || item.productCode || item.key}`,
+        quantity: String(quantity > 0 ? quantity : 1),
+        price: toPriceString(unitPrice),
+        hs_sku: item.productCode || `DEMO-${item.key.toUpperCase()}`,
         hs_recurring_billing_period: 'P12M',
-        description: `FinQuery CPQ demo line item | FQ_DEMO_YEAR:${item.year}`,
+        description: `FinQuery CPQ demo line item | FQ_DEMO_PRODUCT_KEY:${item.key}`,
         revenue_type: item.revenueType,
       };
 
@@ -1813,21 +1928,20 @@ app.post('/api/upsert-demo-line-items', async (req, res) => {
         props.hs_recurring_billing_start_date = item.startDate;
       }
 
-      const existing = existingManagedByYear[item.year];
+      const existing = existingManagedByKey[item.key];
       if (existing?.id) {
         await updateLineItemWithFallback(existing.id, props);
         updated++;
-        lineItems.push({ id: existing.id, year: item.year, ...props });
+        lineItems.push({ id: existing.id, key: item.key, ...props });
       } else {
         const createdItem = await createDealLineItemWithFallback(dealId, props);
         created++;
-        lineItems.push({ id: createdItem.id, year: item.year, ...props });
+        lineItems.push({ id: createdItem.id, key: item.key, ...props });
       }
     }
 
-    for (const [yearKey, existing] of Object.entries(existingManagedByYear)) {
-      const year = parseInt(yearKey, 10);
-      if (incomingYearSet.has(year)) continue;
+    for (const [key, existing] of Object.entries(existingManagedByKey)) {
+      if (incomingKeySet.has(key)) continue;
       if (!existing?.id) continue;
       try {
         await hs.delete(`/crm/v3/objects/line_items/${existing.id}`);
@@ -1839,7 +1953,7 @@ app.post('/api/upsert-demo-line-items', async (req, res) => {
 
     res.json({
       success: true,
-      message: `Demo line items synced (${created} created, ${updated} updated, ${removed} removed)`,
+      message: `Demo product line items synced (${created} created, ${updated} updated, ${removed} removed)`,
       created,
       updated,
       removed,
