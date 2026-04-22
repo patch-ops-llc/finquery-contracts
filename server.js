@@ -1616,24 +1616,50 @@ app.get('/api/load-company-contracts', async (req, res) => {
       try {
         const c = await getObject(contractTypeId, cid, CONTRACT_PROPS);
         const cp = c.properties;
-        const arr = parseFloat(cp.total_arr) || 0;
-        const tcv = parseFloat(cp.total_tcv) || 0;
+        const rawStatus = cp.status;
+        const derivedStatus = determineStatus(cp.start_date, cp.end_date);
+        const status =
+          rawStatus === 'terminated' || rawStatus === 'draft' || rawStatus === 'in_approval_process'
+            ? rawStatus
+            : derivedStatus;
+
+        let arr = parseFloat(cp.total_arr) || 0;
+        let tcv = parseFloat(cp.total_tcv) || 0;
+        let lqA = parseFloat(cp.lq_arr) || 0;
+        let fcmA = parseFloat(cp.fcm_arr) || 0;
+
+        if (subscriptionTypeId) {
+          const subIds = await getAssociatedIds(contractTypeId, cid, subscriptionTypeId);
+          if (subIds.length > 0) {
+            const subs = [];
+            for (const sid of subIds) {
+              try {
+                subs.push(await getObject(subscriptionTypeId, sid, SUBSCRIPTION_PROPS));
+              } catch (e) { /* skip inaccessible */ }
+            }
+            if (subs.length > 0) {
+              const metrics = calcMetrics(subs);
+              arr = metrics.total_arr;
+              tcv = metrics.total_tcv;
+              lqA = metrics.lq_arr;
+              fcmA = metrics.fcm_arr;
+            }
+          }
+        }
         const mrr = arr / 12;
 
         ltv += tcv;
 
-        if (cp.status === 'active') {
+        if (status === 'active') {
           activeContracts++;
           totalArr += arr;
           totalMrr += mrr;
           totalTcv += tcv;
-          lqArr += parseFloat(cp.lq_arr) || 0;
-          fcmArr += parseFloat(cp.fcm_arr) || 0;
+          lqArr += lqA;
+          fcmArr += fcmA;
         }
 
         const products = [];
-        const lqA = parseFloat(cp.lq_arr) || 0;
-        const fcmA = parseFloat(cp.fcm_arr) || 0;
         if (lqA > 0) products.push({ name: 'LeaseQuery', code: 'LQ', arr: lqA });
         if (fcmA > 0) products.push({ name: 'FCM', code: 'FCM', arr: fcmA });
 
@@ -1642,7 +1668,8 @@ app.get('/api/load-company-contracts', async (req, res) => {
           objectTypeId: contractTypeId,
           name: cp.contract_name,
           number: cp.contract_number,
-          status: cp.status,
+          status,
+          rawStatus,
           arr,
           mrr,
           tcv,
