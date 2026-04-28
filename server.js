@@ -18,7 +18,74 @@ if (!TOKEN) {
 const hs = axios.create({
   baseURL: 'https://api.hubapi.com',
   headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
+  timeout: 30000,
 });
+
+// ── HubSpot Rate-Limit Handling ──────────────────────────────────────────────
+// HubSpot Private Apps cap at 100 req / 10 sec (150 on Pro/Enterprise). Without
+// retry/backoff a single burst (e.g. closing a multi-year deal that creates
+// many subscription segments + associations) trips a 429 and the whole request
+// fails. This interceptor retries 429 / 502 / 503 / 504 with exponential
+// backoff + jitter, honoring the `Retry-After` header when present.
+const HS_MAX_RETRIES = 5;
+const HS_BASE_DELAY_MS = 500;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function shouldRetryHubSpot(error) {
+  if (!error || !error.config) return false;
+  if (error.config.__hsNoRetry) return false;
+  const status = error.response?.status;
+  if (status === 429) return true;
+  if (status === 502 || status === 503 || status === 504) return true;
+  // Retry transient network failures (ECONNRESET, ETIMEDOUT, etc.) once or twice.
+  if (!error.response && error.code && ['ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED', 'EAI_AGAIN'].includes(error.code)) {
+    return true;
+  }
+  return false;
+}
+
+function computeRetryDelay(error, attempt) {
+  const retryAfterHeader = error.response?.headers?.['retry-after'];
+  if (retryAfterHeader) {
+    const seconds = Number(retryAfterHeader);
+    if (Number.isFinite(seconds) && seconds > 0) {
+      return Math.min(seconds * 1000, 15000);
+    }
+  }
+  const exp = HS_BASE_DELAY_MS * Math.pow(2, attempt);
+  const jitter = Math.floor(Math.random() * 250);
+  return Math.min(exp + jitter, 10000);
+}
+
+hs.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    const config = error.config;
+    if (!config) return Promise.reject(error);
+    config.__hsRetryCount = config.__hsRetryCount || 0;
+
+    if (config.__hsRetryCount >= HS_MAX_RETRIES || !shouldRetryHubSpot(error)) {
+      if (error.response?.status === 429) {
+        console.error(
+          `[hubspot] 429 after ${config.__hsRetryCount} retries on ${config.method?.toUpperCase()} ${config.url}`
+        );
+      }
+      return Promise.reject(error);
+    }
+
+    const delayMs = computeRetryDelay(error, config.__hsRetryCount);
+    config.__hsRetryCount += 1;
+    console.warn(
+      `[hubspot] ${error.response?.status || error.code || 'network'} on ${config.method?.toUpperCase()} ${config.url} ` +
+      `— retry ${config.__hsRetryCount}/${HS_MAX_RETRIES} in ${delayMs}ms`
+    );
+    await sleep(delayMs);
+    return hs.request(config);
+  }
+);
 
 // ── Product Registry ─────────────────────────────────────────────────────────
 const PRODUCT_REGISTRY = {

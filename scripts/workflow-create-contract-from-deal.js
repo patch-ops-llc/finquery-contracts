@@ -297,6 +297,58 @@ exports.main = async (event, callback) => {
       timeout: 20000,
     });
 
+    // HubSpot Private Apps cap at 100 req / 10 sec. Without retry/backoff a
+    // single closed-deal burst (segment + association calls) trips a 429 and
+    // surfaces as "Request failed with status code 429". Retry 429 / 5xx with
+    // exponential backoff + jitter, honoring `Retry-After`. Workflow custom
+    // code actions have a ~20s wall clock so we keep the budget tight.
+    const HS_MAX_RETRIES = 4;
+    const HS_BASE_DELAY_MS = 400;
+    const HS_MAX_DELAY_MS = 4000;
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const shouldRetry = (err) => {
+      const status = err?.response?.status;
+      if (status === 429 || status === 502 || status === 503 || status === 504) return true;
+      if (!err?.response && err?.code && ['ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED', 'EAI_AGAIN'].includes(err.code)) {
+        return true;
+      }
+      return false;
+    };
+    const computeDelay = (err, attempt) => {
+      const retryAfter = err?.response?.headers?.['retry-after'];
+      if (retryAfter) {
+        const seconds = Number(retryAfter);
+        if (Number.isFinite(seconds) && seconds > 0) {
+          return Math.min(seconds * 1000, HS_MAX_DELAY_MS);
+        }
+      }
+      return Math.min(HS_BASE_DELAY_MS * Math.pow(2, attempt) + Math.floor(Math.random() * 200), HS_MAX_DELAY_MS);
+    };
+    hs.interceptors.response.use(
+      (response) => response,
+      async (error) => {
+        const config = error.config;
+        if (!config) return Promise.reject(error);
+        config.__hsRetryCount = config.__hsRetryCount || 0;
+        if (config.__hsRetryCount >= HS_MAX_RETRIES || !shouldRetry(error)) {
+          if (error.response?.status === 429) {
+            console.error(
+              `[hubspot] 429 after ${config.__hsRetryCount} retries on ${config.method?.toUpperCase()} ${config.url}`
+            );
+          }
+          return Promise.reject(error);
+        }
+        const delayMs = computeDelay(error, config.__hsRetryCount);
+        config.__hsRetryCount += 1;
+        console.warn(
+          `[hubspot] ${error.response?.status || error.code || 'network'} on ${config.method?.toUpperCase()} ${config.url} ` +
+          `— retry ${config.__hsRetryCount}/${HS_MAX_RETRIES} in ${delayMs}ms`
+        );
+        await sleep(delayMs);
+        return hs.request(config);
+      }
+    );
+
     const [contractTypeId, subscriptionTypeId] = await Promise.all([
       getTypeIdBySchemaName(hs, 'fq_contract'),
       getTypeIdBySchemaName(hs, 'fq_subscription'),
