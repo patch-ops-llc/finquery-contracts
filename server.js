@@ -23,12 +23,13 @@ const hs = axios.create({
 // ── Product Registry ─────────────────────────────────────────────────────────
 const PRODUCT_REGISTRY = {
   LQ:  { code: 'LQ',  name: 'LeaseQuery',                category: 'core', arrField: 'lq_arr' },
-  FCM: { code: 'FCM', name: 'FinQuery Contract Management', category: 'core', arrField: 'fcm_arr' },
+  FCM: { code: 'FCM', name: 'Financial Close Management', category: 'core', arrField: 'fcm_arr' },
 };
 
 // ── Type ID Cache ────────────────────────────────────────────────────────────
 let contractTypeId = null;
 let subscriptionTypeId = null;
+let companyArrPropertyMap = null;
 
 async function resolveTypeIds() {
   if (contractTypeId && subscriptionTypeId) return;
@@ -361,6 +362,7 @@ const DEAL_PROPERTIES = [
     options: [
       { label: 'New Business', value: 'new_business' },
       { label: 'Renewal', value: 'renewal' },
+      { label: 'Amendment', value: 'amendment' },
       { label: 'Expansion', value: 'expansion' },
       { label: 'Contraction', value: 'contraction' },
     ],
@@ -462,6 +464,123 @@ async function createAssociation(fromType, fromId, toType, toId) {
   );
 }
 
+function normalizePropertyLabel(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
+}
+
+async function resolveCompanyArrPropertyMap() {
+  if (companyArrPropertyMap) return companyArrPropertyMap;
+
+  const fallback = {
+    currentArr: null,
+    activeArr: null,
+  };
+
+  const fallbackCandidates = {
+    currentArr: ['current_arr', 'current_arr__c', 'currentannualrecurringrevenue'],
+    activeArr: ['active_arr', 'active_arr__c', 'activeannualrecurringrevenue'],
+  };
+
+  try {
+    const { data } = await hs.get('/crm/v3/properties/0-2', {
+      params: { archived: false },
+    });
+    const props = data.results || [];
+    const availableNames = new Set(props.map((p) => p.name));
+
+    const findByLabel = (label) => {
+      const normalizedLabel = normalizePropertyLabel(label);
+      const found = props.find((p) => normalizePropertyLabel(p.label) === normalizedLabel);
+      return found?.name || null;
+    };
+
+    const resolveName = (label, candidates) =>
+      findByLabel(label) || candidates.find((name) => availableNames.has(name)) || null;
+
+    companyArrPropertyMap = {
+      currentArr: resolveName('Current ARR', fallbackCandidates.currentArr),
+      activeArr: resolveName('Active ARR', fallbackCandidates.activeArr),
+    };
+    return companyArrPropertyMap;
+  } catch (e) {
+    console.warn('[company-arr] Could not resolve company ARR property names:', e.response?.data?.message || e.message);
+    companyArrPropertyMap = fallback;
+    return companyArrPropertyMap;
+  }
+}
+
+async function syncCompanyArrRollups(companyId) {
+  if (!companyId) {
+    return {
+      companyId,
+      totalArr: 0,
+      activeContracts: 0,
+      updatedProperties: [],
+    };
+  }
+
+  await resolveTypeIds();
+  if (!contractTypeId) {
+    return {
+      companyId,
+      totalArr: 0,
+      activeContracts: 0,
+      updatedProperties: [],
+      warning: 'Contract schema not found',
+    };
+  }
+
+  const contractIds = await getAssociatedIds('0-2', companyId, contractTypeId);
+  let totalArr = 0;
+  let activeContracts = 0;
+
+  for (const cid of contractIds) {
+    try {
+      const contract = await getObject(contractTypeId, cid, ['status', 'total_arr']);
+      const cp = contract.properties || {};
+      if (cp.status === 'active') {
+        activeContracts++;
+        totalArr += parseFloat(cp.total_arr) || 0;
+      }
+    } catch (e) {
+      console.warn(`[company-arr] Skipping contract ${cid} while syncing company ${companyId}:`, e.message);
+    }
+  }
+
+  const propertyMap = await resolveCompanyArrPropertyMap();
+  const updates = {};
+  if (propertyMap.currentArr) updates[propertyMap.currentArr] = String(totalArr);
+  if (propertyMap.activeArr) updates[propertyMap.activeArr] = String(totalArr);
+
+  const updatedProperties = Object.keys(updates);
+  if (updatedProperties.length > 0) {
+    try {
+      await updateObject('0-2', companyId, updates);
+    } catch (e) {
+      console.warn(`[company-arr] Failed updating company ${companyId}:`, e.response?.data?.message || e.message);
+      return {
+        companyId,
+        totalArr,
+        activeContracts,
+        updatedProperties: [],
+        warning: 'Company ARR property update failed',
+      };
+    }
+  } else {
+    console.warn(`[company-arr] No company ARR properties found for company ${companyId} (wanted Current ARR / Active ARR).`);
+  }
+
+  return {
+    companyId,
+    totalArr,
+    activeContracts,
+    updatedProperties,
+  };
+}
+
 function fmtDateForHS(d) {
   if (!d) return null;
   const dt = d instanceof Date ? d : new Date(d);
@@ -469,50 +588,11 @@ function fmtDateForHS(d) {
   return dt.toISOString().split('T')[0];
 }
 
-function parseDateValue(value) {
-  if (!value) return null;
-  if (value instanceof Date) {
-    return Number.isNaN(value.getTime()) ? null : new Date(value);
-  }
-  if (typeof value === 'number') {
-    const d = new Date(value);
-    return Number.isNaN(d.getTime()) ? null : d;
-  }
-  if (typeof value === 'string') {
-    const trimmed = value.trim();
-    if (!trimmed) return null;
-
-    // HubSpot date-only fields are "YYYY-MM-DD"; parse in local time to avoid
-    // timezone-driven day shifts (e.g., 3/16 rendering as 3/15).
-    const ymd = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-    if (ymd) {
-      const y = Number(ymd[1]);
-      const m = Number(ymd[2]) - 1;
-      const d = Number(ymd[3]);
-      const parsed = new Date(y, m, d);
-      return Number.isNaN(parsed.getTime()) ? null : parsed;
-    }
-
-    if (/^\d+$/.test(trimmed)) {
-      const d = new Date(Number(trimmed));
-      return Number.isNaN(d.getTime()) ? null : d;
-    }
-
-    const parsed = new Date(trimmed);
-    return Number.isNaN(parsed.getTime()) ? null : parsed;
-  }
-  return null;
-}
-
-function getContractEndDate(props = {}) {
-  return props.end_date || props.co_term_date || null;
-}
-
 function determineStatus(startDate, endDate) {
   const now = new Date();
   now.setHours(0, 0, 0, 0);
-  const start = parseDateValue(startDate);
-  const end = parseDateValue(endDate);
+  const start = startDate ? new Date(startDate) : null;
+  const end = endDate ? new Date(endDate) : null;
   if (start) start.setHours(0, 0, 0, 0);
   if (end) end.setHours(0, 0, 0, 0);
 
@@ -522,92 +602,19 @@ function determineStatus(startDate, endDate) {
   return 'expired';
 }
 
-function toMidnight(value) {
-  const d = parseDateValue(value);
-  if (!d) return null;
-  d.setHours(0, 0, 0, 0);
-  return d;
-}
-
-function chooseCurrentSegmentYear(subscriptions) {
-  const today = toMidnight(new Date());
-  const byYear = new Map();
-
-  for (const sub of subscriptions) {
-    const sp = sub.properties || {};
-    if (sp.status === 'terminated') continue;
-    const year = parseInt(sp.segment_year, 10) || 1;
-    if (!byYear.has(year)) {
-      byYear.set(year, {
-        year,
-        arr: 0,
-        tcv: 0,
-        lqArr: 0,
-        fcmArr: 0,
-        earliestStart: null,
-        latestEnd: null,
-      });
-    }
-    const bucket = byYear.get(year);
-    const arr = parseFloat(sp.arr) || 0;
-    const tcv = parseFloat(sp.tcv) || 0;
-    const code = (sp.product_code || '').toUpperCase();
-    const start = toMidnight(sp.start_date || sp.segment_start_date);
-    const end = toMidnight(sp.end_date || sp.segment_end_date);
-
-    bucket.arr += arr;
-    bucket.tcv += tcv;
-    if (code === 'LQ') bucket.lqArr += arr;
-    if (code === 'FCM') bucket.fcmArr += arr;
-
-    if (start && (!bucket.earliestStart || start < bucket.earliestStart)) {
-      bucket.earliestStart = start;
-    }
-    if (end && (!bucket.latestEnd || end > bucket.latestEnd)) {
-      bucket.latestEnd = end;
-    }
-  }
-
-  if (byYear.size === 0) return null;
-
-  const years = Array.from(byYear.values()).sort((a, b) => a.year - b.year);
-  const active = years.find((y) => {
-    const hasStarted = !y.earliestStart || y.earliestStart <= today;
-    const notEnded = !y.latestEnd || y.latestEnd >= today;
-    return hasStarted && notEnded;
-  });
-  if (active) return active;
-
-  const past = years
-    .filter((y) => y.latestEnd && y.latestEnd < today)
-    .sort((a, b) => b.latestEnd - a.latestEnd);
-  if (past.length > 0) return past[0];
-
-  const future = years
-    .filter((y) => y.earliestStart && y.earliestStart > today)
-    .sort((a, b) => a.earliestStart - b.earliestStart);
-  if (future.length > 0) return future[0];
-
-  return years[0];
-}
-
 function calcMetrics(subscriptions) {
   const metrics = { total_arr: 0, total_tcv: 0, lq_arr: 0, fcm_arr: 0, subscription_count: subscriptions.length };
-  const currentSegment = chooseCurrentSegmentYear(subscriptions);
-
   for (const sub of subscriptions) {
     const sp = sub.properties || {};
     if (sp.status === 'terminated') continue;
+    const arr = parseFloat(sp.arr) || 0;
     const tcv = parseFloat(sp.tcv) || 0;
+    metrics.total_arr += arr;
     metrics.total_tcv += tcv;
+    const code = (sp.product_code || '').toUpperCase();
+    if (code === 'LQ') metrics.lq_arr += arr;
+    if (code === 'FCM') metrics.fcm_arr += arr;
   }
-
-  if (currentSegment) {
-    metrics.total_arr = currentSegment.arr;
-    metrics.lq_arr = currentSegment.lqArr;
-    metrics.fcm_arr = currentSegment.fcmArr;
-  }
-
   return metrics;
 }
 
@@ -1058,33 +1065,6 @@ app.get('/api/load-contract', async (req, res) => {
       }
     }
 
-    const metrics = calcMetrics(subscriptions);
-    const contractProps = contract.properties || {};
-    const shouldUpdateRollups =
-      (parseFloat(contractProps.total_arr) || 0) !== metrics.total_arr ||
-      (parseFloat(contractProps.total_tcv) || 0) !== metrics.total_tcv ||
-      (parseFloat(contractProps.lq_arr) || 0) !== metrics.lq_arr ||
-      (parseFloat(contractProps.fcm_arr) || 0) !== metrics.fcm_arr ||
-      (parseInt(contractProps.subscription_count, 10) || 0) !== metrics.subscription_count;
-
-    if (shouldUpdateRollups) {
-      await updateObject(contractTypeId, contractId, {
-        total_arr: String(metrics.total_arr),
-        total_tcv: String(metrics.total_tcv),
-        lq_arr: String(metrics.lq_arr),
-        fcm_arr: String(metrics.fcm_arr),
-        subscription_count: String(metrics.subscription_count),
-      });
-      contract.properties = {
-        ...contractProps,
-        total_arr: String(metrics.total_arr),
-        total_tcv: String(metrics.total_tcv),
-        lq_arr: String(metrics.lq_arr),
-        fcm_arr: String(metrics.fcm_arr),
-        subscription_count: String(metrics.subscription_count),
-      };
-    }
-
     const companyIds = await getAssociatedIds(contractTypeId, contractId, '0-2');
     let company = null;
     if (companyIds.length > 0) {
@@ -1103,7 +1083,6 @@ app.get('/api/load-contract', async (req, res) => {
           name: d.properties.dealname,
           stage: d.properties.dealstage,
           amount: d.properties.amount,
-          arr: d.properties.amount,
           closeDate: d.properties.closedate,
           category: d.properties.deal_category,
           pipeline: d.properties.pipeline,
@@ -1165,7 +1144,7 @@ app.get('/api/start-amendment', async (req, res) => {
       dealname: dealName,
       dealstage: 'appointmentscheduled',
       contract_start_date: startDate || fmtDateForHS(new Date()),
-      contract_end_date: getContractEndDate(props),
+      contract_end_date: props.end_date || null,
       pipeline: 'default',
     };
 
@@ -1248,9 +1227,6 @@ app.get('/api/terminate-contract', async (req, res) => {
       status: 'terminated',
       terminated_date: fmtDateForHS(new Date()),
       termination_reason: reason || 'manual',
-      total_arr: '0',
-      lq_arr: '0',
-      fcm_arr: '0',
     });
 
     if (subscriptionTypeId) {
@@ -1262,7 +1238,21 @@ app.get('/api/terminate-contract', async (req, res) => {
       }
     }
 
-    res.json({ success: true, message: 'Contract terminated' });
+    const companyIds = await getAssociatedIds(contractTypeId, contractId, '0-2');
+    const companyRollups = [];
+    for (const companyId of companyIds) {
+      try {
+        companyRollups.push(await syncCompanyArrRollups(companyId));
+      } catch (e) {
+        console.warn(`[terminate] Company ARR sync failed for company ${companyId}:`, e.message);
+      }
+    }
+
+    res.json({
+      success: true,
+      message: 'Contract terminated',
+      companyRollups,
+    });
   } catch (e) {
     console.error('[terminate-contract] Error:', e.response?.data || e.message);
     res.status(500).json({ success: false, message: e.message });
@@ -1305,6 +1295,15 @@ app.get('/api/reverse-termination', async (req, res) => {
       }
     }
 
+    const companyIds = await getAssociatedIds(contractTypeId, contractId, '0-2');
+    for (const companyId of companyIds) {
+      try {
+        await syncCompanyArrRollups(companyId);
+      } catch (e) {
+        console.warn(`[reverse-termination] Company ARR sync failed for company ${companyId}:`, e.message);
+      }
+    }
+
     res.json({
       success: true,
       message: `Termination reversed — contract status set to ${newStatus}`,
@@ -1327,7 +1326,7 @@ app.get('/api/create-renewal-deal', async (req, res) => {
     const contract = await getObject(contractTypeId, contractId, CONTRACT_PROPS);
     const props = contract.properties;
 
-    const currentEnd = parseDateValue(getContractEndDate(props)) || new Date();
+    const currentEnd = props.end_date ? new Date(props.end_date) : new Date();
     const renewalStart = new Date(currentEnd);
     renewalStart.setDate(renewalStart.getDate() + 1);
     const renewalEnd = new Date(renewalStart);
@@ -1453,7 +1452,7 @@ app.get('/api/trigger-auto-renewal', async (req, res) => {
       return res.json({ success: true, message: 'Auto-renewal already released', alreadyReleased: true });
     }
 
-    const currentEnd = parseDateValue(getContractEndDate(props)) || new Date();
+    const currentEnd = props.end_date ? new Date(props.end_date) : new Date();
     const renewalStart = new Date(currentEnd);
     renewalStart.setDate(renewalStart.getDate() + 1);
     const renewalEnd = new Date(renewalStart);
@@ -1537,7 +1536,7 @@ app.get('/api/check-auto-renewals', async (req, res) => {
           { propertyName: 'status', operator: 'IN', values: ['active', 'future'] },
         ],
       }],
-      properties: ['contract_name', 'auto_renewal_date', 'auto_renewal_released', 'status', 'end_date', 'co_term_date', 'total_arr'],
+      properties: ['contract_name', 'auto_renewal_date', 'auto_renewal_released', 'status', 'end_date', 'total_arr'],
       limit: 100,
     });
 
@@ -1549,7 +1548,7 @@ app.get('/api/check-auto-renewals', async (req, res) => {
     for (const c of candidates) {
       try {
         const cp = c.properties;
-        const currentEnd = parseDateValue(getContractEndDate(cp)) || new Date();
+        const currentEnd = cp.end_date ? new Date(cp.end_date) : new Date();
         const renewalStart = new Date(currentEnd);
         renewalStart.setDate(renewalStart.getDate() + 1);
         const renewalEnd = new Date(renewalStart);
@@ -1788,7 +1787,6 @@ app.get('/api/load-company-contracts', async (req, res) => {
             }
           }
         }
-
         const mrr = arr / 12;
 
         ltv += tcv;
@@ -1816,8 +1814,8 @@ app.get('/api/load-company-contracts', async (req, res) => {
           arr,
           mrr,
           tcv,
-          startDate: cp.start_date || null,
-          endDate: cp.end_date || cp.co_term_date || null,
+          startDate: cp.start_date,
+          endDate: cp.end_date,
           coTermDate: cp.co_term_date,
           term: parseInt(cp.contract_term) || null,
           renewalTerm: parseInt(cp.renewal_term) || null,
@@ -2004,13 +2002,10 @@ app.post('/api/upsert-demo-line-items', async (req, res) => {
 
     const normalizedProducts = productItems
       .map((item, index) => {
-        const year = parseInt(item?.year, 10);
-        const safeYear = Number.isFinite(year) && year > 0 ? year : null;
-        const baseKey = sanitizeKey(
+        const key = sanitizeKey(
           item?.key || item?.productCode || item?.productName,
           `product-${index + 1}`
         );
-        const key = safeYear ? `${baseKey}-y${safeYear}` : baseKey;
         const quantity = Math.max(0, parseFloat(item?.quantity) || 0);
         const netArr = Math.max(0, parseFloat(item?.netArr) || 0);
         const unitPrice =
@@ -2024,7 +2019,6 @@ app.post('/api/upsert-demo-line-items', async (req, res) => {
           quantity,
           unitPrice,
           netArr,
-          year: safeYear,
           revenueType: normalizeRevenueType(item?.revenueType),
           startDate: fmtDateForHS(item?.startDate),
         };
@@ -2093,7 +2087,7 @@ app.post('/api/upsert-demo-line-items', async (req, res) => {
         price: toPriceString(unitPrice),
         hs_sku: item.productCode || `DEMO-${item.key.toUpperCase()}`,
         hs_recurring_billing_period: 'P12M',
-        description: `FinQuery CPQ demo line item | FQ_DEMO_PRODUCT_KEY:${item.key}${item.year ? ` | FQ_DEMO_YEAR:${item.year}` : ''}`,
+        description: `FinQuery CPQ demo line item | FQ_DEMO_PRODUCT_KEY:${item.key}`,
         revenue_type: item.revenueType,
       };
 
@@ -2126,7 +2120,7 @@ app.post('/api/upsert-demo-line-items', async (req, res) => {
 
     res.json({
       success: true,
-      message: `Demo product/year line items synced (${created} created, ${updated} updated, ${removed} removed)`,
+      message: `Demo product line items synced (${created} created, ${updated} updated, ${removed} removed)`,
       created,
       updated,
       removed,
@@ -2160,6 +2154,18 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
 
     const category = dp.deal_category || 'new_business';
     const contractIds = await getAssociatedIds('0-3', dealId, contractTypeId);
+    const syncCompanyArrForIds = async (companyIds = []) => {
+      const uniqueIds = [...new Set((companyIds || []).filter(Boolean))];
+      const results = [];
+      for (const companyId of uniqueIds) {
+        try {
+          results.push(await syncCompanyArrRollups(companyId));
+        } catch (e) {
+          console.warn(`[update-contract] Company ARR sync failed for company ${companyId}:`, e.message);
+        }
+      }
+      return results;
+    };
 
     // ── Helper: read deal line items ─────────────────────────────────
     async function getDealLineItems() {
@@ -2344,12 +2350,15 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
         }
       }
 
+      const companyRollups = await syncCompanyArrForIds(companyId ? [companyId] : []);
+
       return res.json({
         success: true,
         message: `New contract created with ${segmentsCreated} subscription segments and ${contractLineItems} line items`,
         contractId: contract.id,
         segmentsCreated,
         contractLineItems,
+        companyRollups,
       });
     }
 
@@ -2433,6 +2442,8 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
           contract_renewed_on: fmtDateForHS(new Date()),
         });
 
+        const companyRollups = await syncCompanyArrForIds(companyId ? [companyId] : []);
+
         return res.json({
           success: true,
           message: `Renewal contract created: ${renewalStart} → ${renewalEnd} (${segmentsCreated} segments, ${contractLineItemsCopied} line items). Old contract ${cid} expired.`,
@@ -2440,6 +2451,7 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
           oldContractId: cid,
           segmentsCreated,
           contractLineItems: contractLineItemsCopied,
+          companyRollups,
         });
       }
 
@@ -2450,7 +2462,7 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
         const companyId = companyIds.length > 0 ? companyIds[0] : null;
 
         const amendStartDate = dp.contract_start_date || cp.amendment_start_date || fmtDateForHS(new Date());
-        const amendEndDate = dp.contract_end_date || getContractEndDate(cp);
+        const amendEndDate = dp.contract_end_date || cp.end_date;
 
         let segmentsCreated = 0;
         let contractLineItemsCopied = 0;
@@ -2524,6 +2536,7 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
         }
 
         await updateObject(contractTypeId, cid, updates);
+        const companyRollups = await syncCompanyArrForIds(companyId ? [companyId] : []);
 
         const terminated = updates.status === 'terminated';
         return res.json({
@@ -2534,6 +2547,7 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
           contractId: cid,
           segmentsCreated,
           autoTerminated: terminated,
+          companyRollups,
         });
       }
 
@@ -2545,7 +2559,15 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
         await updateObject(contractTypeId, cid, updates);
       }
 
-      return res.json({ success: true, message: `Contract ${cid} updated from deal`, contractId: cid });
+      const fallbackCompanyIds = await getAssociatedIds(contractTypeId, cid, '0-2');
+      const companyRollups = await syncCompanyArrForIds(fallbackCompanyIds);
+
+      return res.json({
+        success: true,
+        message: `Contract ${cid} updated from deal`,
+        contractId: cid,
+        companyRollups,
+      });
     }
 
     res.json({ success: true, message: 'No contract associated and not new business — no action' });
@@ -2719,7 +2741,7 @@ app.get('/api/seed-subscriptions', async (req, res) => {
           segment_name: `${contractName} — FCM Year 1`,
           subscription_number: `SUB-${cId}-FCM-01`,
           product_code: 'FCM',
-          product_name: 'FinQuery Contract Management',
+          product_name: 'Financial Close Management',
           product_subscription_type: 'renewable',
           subscription_type: 'renewable',
           charge_type: 'recurring',
@@ -2754,7 +2776,7 @@ app.get('/api/seed-subscriptions', async (req, res) => {
           segment_name: `${contractName} — FCM Year 2`,
           subscription_number: `SUB-${cId}-FCM-02`,
           product_code: 'FCM',
-          product_name: 'FinQuery Contract Management',
+          product_name: 'Financial Close Management',
           product_subscription_type: 'renewable',
           subscription_type: 'renewable',
           charge_type: 'recurring',
