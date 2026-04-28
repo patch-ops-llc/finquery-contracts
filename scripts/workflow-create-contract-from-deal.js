@@ -6,6 +6,18 @@
  * - Reads deal + associated line items
  * - Creates one Contract record
  * - Creates supporting Subscription Segment records by engagement year
+ * - For new_business / renewal deals ONLY, immediately spawns the next-cycle
+ *   renewal deal with closedate = the new contract's end date so the renewal
+ *   lands in the correct forecast quarter. Amendment / expansion / contraction
+ *   deals never spawn a renewal here (per Apr 28 training session).
+ *
+ * Workflow trigger requirements (configure in HubSpot UI):
+ * - Trigger on Deal stage = Closed Won
+ * - Filter OUT amendment / expansion / contraction deals — this action only
+ *   runs for new_business + renewal categories. (You can also rely on the
+ *   built-in category check below; the filter is for performance / clarity.)
+ * - The 120-day "renewal quote" generation logic stays in DealHub and is NOT
+ *   what this action does. This action creates the renewal DEAL only.
  *
  * Workflow setup:
  * 1) Add an input field named `dealId` (or pass `hs_object_id` from deal-based workflow)
@@ -18,6 +30,8 @@
  *    - oneTimeLineItems (number)
  *    - totalArr (number)
  *    - status (string)
+ *    - renewalDealId (string)         — populated for new_business / renewal closes
+ *    - renewalDealClosedate (string)  — YYYY-MM-DD; matches the new contract's end date
  *    - errorMessage (string)
  */
 const axios = require('axios');
@@ -521,6 +535,94 @@ exports.main = async (event, callback) => {
       },
     });
 
+    // ── Auto-spawn next-cycle renewal deal ───────────────────────────────────
+    // Per Apr 28 training: renewal deals must be generated IMMEDIATELY on
+    // Closed Won (not waiting until contract end + 1 day) so they land in the
+    // forecast for the contract's end-date quarter. Only fires for new
+    // business + renewal categories; amendments / expansions / contractions
+    // never spawn renewal deals from this workflow.
+    let renewalDealId = '';
+    let renewalDealClosedate = '';
+    const renewalEligibleCategories = ['new_business', 'renewal'];
+    if (renewalEligibleCategories.includes(category)) {
+      try {
+        // Skip if an open renewal deal already exists on this contract.
+        const existingDealIds = await getAssociatedIds(hs, contractTypeId, contract.id, '0-3');
+        let openRenewalExists = false;
+        for (const did of existingDealIds.slice(0, 25)) {
+          try {
+            const existingDeal = await getObject(hs, '0-3', did, ['dealstage', 'deal_category']);
+            const stage = String(existingDeal?.properties?.dealstage || '').toLowerCase();
+            const cat = String(existingDeal?.properties?.deal_category || '').toLowerCase();
+            if (cat === 'renewal' && stage !== 'closedwon' && stage !== 'closedlost') {
+              openRenewalExists = true;
+              break;
+            }
+          } catch (peekErr) {
+            // Best-effort: if a single deal lookup fails, keep scanning.
+          }
+        }
+
+        if (!openRenewalExists) {
+          // Renewal term: day after current end → +1 year. Close date is the
+          // current contract end date so the deal lands in the right
+          // forecast quarter.
+          const nextStart = parseDateValue(derivedEndDate) || new Date();
+          nextStart.setUTCDate(nextStart.getUTCDate() + 1);
+          const nextEnd = new Date(nextStart);
+          nextEnd.setUTCFullYear(nextEnd.getUTCFullYear() + 1);
+          renewalDealClosedate = derivedEndDate;
+
+          const renewalDealName = `${cleanedContractName} — Renewal`;
+          const renewalDeal = await createObject(hs, '0-3', {
+            dealname: renewalDealName,
+            dealstage: 'appointmentscheduled',
+            deal_category: 'renewal',
+            contract_start_date: fmtDateForHS(nextStart),
+            contract_end_date: fmtDateForHS(nextEnd),
+            closedate: derivedEndDate,
+            amount: String(totalArr || 0),
+            pipeline: 'default',
+          });
+          renewalDealId = String(renewalDeal.id);
+
+          // Carry the company + contacts + new contract over to the renewal
+          // deal so DealHub has the full context immediately.
+          if (companyIds[0]) {
+            try {
+              await associateWithFallback(hs, '0-3', renewalDeal.id, '0-2', companyIds[0]);
+            } catch (assocErr) {
+              console.warn(`Renewal deal company association failed: ${assocErr.message}`);
+            }
+          }
+          try {
+            await associateWithFallback(hs, contractTypeId, contract.id, '0-3', renewalDeal.id);
+          } catch (assocErr) {
+            console.warn(`Renewal deal -> contract association failed: ${assocErr.message}`);
+          }
+          for (const contactId of contactIds) {
+            try {
+              await associateWithFallback(hs, '0-3', renewalDeal.id, '0-1', contactId);
+            } catch (contactErr) {
+              // Skip invalid contacts — best-effort.
+            }
+          }
+
+          console.log(
+            `Renewal deal ${renewalDeal.id} auto-created for contract ${contract.id} ` +
+            `(${fmtDateForHS(nextStart)} → ${fmtDateForHS(nextEnd)}, closedate=${derivedEndDate})`
+          );
+        } else {
+          console.log(`Skipping renewal deal auto-creation; an open renewal already exists for contract ${contract.id}`);
+        }
+      } catch (renewalErr) {
+        // Failing to spawn the renewal deal must NOT fail the contract creation.
+        console.warn(`Renewal deal auto-creation failed: ${renewalErr.message}`);
+      }
+    } else {
+      console.log(`Skipping renewal deal auto-creation; deal_category=${category} is not new_business or renewal`);
+    }
+
     callback({
       outputFields: {
         success: 'true',
@@ -530,6 +632,8 @@ exports.main = async (event, callback) => {
         oneTimeLineItems,
         totalArr,
         status: determineStatus(derivedStartDate, derivedEndDate),
+        renewalDealId,
+        renewalDealClosedate,
         errorMessage: segmentErrors.length ? segmentErrors.slice(0, 3).join(' | ') : '',
       },
     });
@@ -544,6 +648,8 @@ exports.main = async (event, callback) => {
         oneTimeLineItems: 0,
         totalArr: 0,
         status: '',
+        renewalDealId: '',
+        renewalDealClosedate: '',
         errorMessage: err.message || 'Unknown error',
       },
     });

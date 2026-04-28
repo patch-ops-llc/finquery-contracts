@@ -96,6 +96,24 @@ const PRODUCT_REGISTRY = {
 // Prevent slow card loads on contracts with very large deal histories.
 const CARD_DEAL_LOAD_LIMIT = 10;
 
+// ── Super Admin Allowlist ────────────────────────────────────────────────────
+// Test-data buttons (Load Test Data, Load NetSuite Test Data, etc.) and other
+// privileged actions are only shown in the UI for users in this allowlist. The
+// list is sourced from the SUPER_ADMIN_EMAILS env var (comma-separated) and is
+// surfaced to the cards via /api/ensure-setup so the front-end can compare
+// against context.user.email. Defaults cover Zach + Betty for the FinQuery
+// engagement so the buttons stay usable in sandbox even if the env var is not
+// set; production should override this via Railway env config.
+const SUPER_ADMIN_EMAILS = (process.env.SUPER_ADMIN_EMAILS || 'zach@patchops.io,betty@patchops.io')
+  .split(',')
+  .map((e) => e.trim().toLowerCase())
+  .filter(Boolean);
+
+function isSuperAdminEmail(email) {
+  if (!email) return false;
+  return SUPER_ADMIN_EMAILS.includes(String(email).trim().toLowerCase());
+}
+
 // ── Type ID Cache ────────────────────────────────────────────────────────────
 let contractTypeId = null;
 let subscriptionTypeId = null;
@@ -1354,7 +1372,12 @@ async function ensureSetup() {
   }
 
   console.log(`[ensureSetup] Ready — contract=${contractTypeId}, subscription=${subscriptionTypeId}`);
-  return { contractTypeId, subscriptionTypeId, productRegistry: PRODUCT_REGISTRY };
+  return {
+    contractTypeId,
+    subscriptionTypeId,
+    productRegistry: PRODUCT_REGISTRY,
+    superAdminEmails: SUPER_ADMIN_EMAILS,
+  };
 }
 
 // ── Route: Health ────────────────────────────────────────────────────────────
@@ -1363,7 +1386,13 @@ const API_VERSION = '2026-04-08a';
 
 app.get('/', (req, res) => res.json({ status: 'ok', service: 'finquery-contracts-api', version: API_VERSION }));
 
-app.get('/api/health', (req, res) => res.json({ status: 'ok', version: API_VERSION, contractTypeId, subscriptionTypeId }));
+app.get('/api/health', (req, res) => res.json({
+  status: 'ok',
+  version: API_VERSION,
+  contractTypeId,
+  subscriptionTypeId,
+  superAdminEmails: SUPER_ADMIN_EMAILS,
+}));
 
 // ── Route: Test Line Item Creation ───────────────────────────────────────────
 
@@ -1564,6 +1593,7 @@ app.get('/api/load-contract', async (req, res) => {
       contacts,
       portalId,
       productRegistry: PRODUCT_REGISTRY,
+      superAdminEmails: SUPER_ADMIN_EMAILS,
     });
   } catch (e) {
     console.error('[load-contract] Error:', e.response?.data || e.message);
@@ -1763,28 +1793,39 @@ app.get('/api/reverse-termination', async (req, res) => {
   }
 });
 
-// ── Route: Create Renewal Deal ───────────────────────────────────────────────
+// ── Helper: Create a renewal deal for a given contract ───────────────────────
+// Shared by:
+//   - /api/create-renewal-deal (manual click from the contract card)
+//   - /api/update-contract-from-deal (auto-spawn on Closed Won for new business
+//     and renewal deals; per Apr 28 training: renewals are now generated
+//     immediately on Closed Won so the next-cycle deal shows in the forecast,
+//     not at end-of-term + 1)
+// Returns { success, dealId, dealName, lineItemsCreated, warnings, existing? }.
+async function createRenewalDealForContract(contractId, options = {}) {
+  const {
+    nameSuffix = 'Renewal',           // e.g. 'Renewal', 'Auto-Renewal'
+    closeDateOverride = null,         // close date should = current contract end date for forecasting
+    contractPropsOverride = null,     // optional pre-fetched props to avoid an extra GET
+    skipIfOpenRenewalExists = true,
+    pipeline = 'default',
+    dealStage = 'appointmentscheduled',
+  } = options;
 
-app.get('/api/create-renewal-deal', async (req, res) => {
-  try {
-    const { contractId } = req.query;
-    if (!contractId) return res.status(400).json({ success: false, message: 'contractId required' });
+  await resolveTypeIds();
 
-    await resolveTypeIds();
-    const contract = await getObject(contractTypeId, contractId, CONTRACT_PROPS);
-    const props = contract.properties;
+  const props = contractPropsOverride
+    || (await getObject(contractTypeId, contractId, CONTRACT_PROPS)).properties;
 
-    const currentEnd = parseDateValue(getContractEndDate(props)) || new Date();
-    const renewalStart = new Date(currentEnd);
-    renewalStart.setDate(renewalStart.getDate() + 1);
-    const renewalEnd = new Date(renewalStart);
-    renewalEnd.setFullYear(renewalEnd.getFullYear() + 1);
+  const currentEndDate = parseDateValue(getContractEndDate(props)) || new Date();
+  const renewalStart = new Date(currentEndDate);
+  renewalStart.setDate(renewalStart.getDate() + 1);
+  const renewalEnd = new Date(renewalStart);
+  renewalEnd.setFullYear(renewalEnd.getFullYear() + 1);
 
-    const dealName = `${props.contract_name || 'Contract'} — Renewal`;
+  const dealName = `${props.contract_name || 'Contract'} — ${nameSuffix}`;
+  const warnings = [];
 
-    // Idempotency: if there's already an OPEN renewal deal associated to this contract,
-    // return it instead of creating a duplicate. This prevents accidental duplicates
-    // from rapid double-clicks or client retries on slow responses.
+  if (skipIfOpenRenewalExists) {
     const existingDealIds = await getAssociatedIds(contractTypeId, contractId, '0-3');
     if (existingDealIds.length > 0) {
       const existingDeals = await Promise.allSettled(
@@ -1802,93 +1843,138 @@ app.get('/api/create-renewal-deal', async (req, res) => {
         });
       if (openRenewal) {
         console.log(
-          `[create-renewal] Open renewal deal already exists for contract ${contractId}: ${openRenewal.id}. Returning existing deal.`
+          `[renewal-helper] Open renewal deal already exists for contract ${contractId}: ${openRenewal.id}. Reusing.`
         );
-        return res.json({
+        return {
           success: true,
-          message: `An open renewal deal already exists for this contract: ${openRenewal.properties?.dealname || openRenewal.id}. Reusing it instead of creating a duplicate.`,
+          existing: true,
           dealId: openRenewal.id,
           dealName: openRenewal.properties?.dealname || dealName,
-          existing: true,
+          lineItemsCreated: 0,
           warnings: ['An open renewal deal already existed; no new deal was created.'],
-        });
+        };
       }
     }
+  }
 
-    const deal = await createObject('0-3', {
-      dealname: dealName,
-      dealstage: 'appointmentscheduled',
-      deal_category: 'renewal',
-      contract_start_date: fmtDateForHS(renewalStart),
-      contract_end_date: fmtDateForHS(renewalEnd),
-      amount: props.total_arr || '0',
-      pipeline: 'default',
-    });
+  // Per Apr 28 training: close date = current contract end date so the
+  // renewal deal lands in the right forecast quarter even though it was
+  // created at Closed Won of the prior term.
+  const closeDate = closeDateOverride
+    || fmtDateForHS(parseDateValue(getContractEndDate(props)) || renewalStart);
 
-    const warnings = [];
+  const deal = await createObject('0-3', {
+    dealname: dealName,
+    dealstage: dealStage,
+    deal_category: 'renewal',
+    contract_start_date: fmtDateForHS(renewalStart),
+    contract_end_date: fmtDateForHS(renewalEnd),
+    closedate: closeDate,
+    amount: props.total_arr || '0',
+    pipeline,
+  });
 
-    const companyIds = await getAssociatedIds(contractTypeId, contractId, '0-2');
-    if (companyIds.length > 0) {
-      try {
-        await createAssociation('0-3', deal.id, '0-2', companyIds[0]);
-      } catch (e) {
-        console.warn('[create-renewal] Company association failed:', e.response?.data?.message || e.message);
-        warnings.push('Company association failed — some contacts on this company may be invalid');
-      }
-    }
-
+  const companyIds = await getAssociatedIds(contractTypeId, contractId, '0-2');
+  if (companyIds.length > 0) {
     try {
-      await createAssociation(contractTypeId, contractId, '0-3', deal.id);
+      await createAssociation('0-3', deal.id, '0-2', companyIds[0]);
     } catch (e) {
-      console.warn('[create-renewal] Could not associate deal to contract:', e.message);
+      console.warn('[renewal-helper] Company association failed:', e.response?.data?.message || e.message);
+      warnings.push('Company association failed — some contacts on this company may be invalid');
     }
+  }
 
-    const contactIds = await getAssociatedIds(contractTypeId, contractId, '0-1');
-    let contactsLinked = 0;
-    for (const cid of contactIds) {
-      try {
-        await createAssociation('0-3', deal.id, '0-1', cid);
-        contactsLinked++;
-      } catch (e) {
-        console.warn(`[create-renewal] Skipping invalid contact ${cid}:`, e.response?.data?.message || e.message);
-      }
-    }
-    if (contactIds.length > 0 && contactsLinked < contactIds.length) {
-      warnings.push(`${contactIds.length - contactsLinked} of ${contactIds.length} contact associations failed (likely deleted contacts)`);
-    }
+  try {
+    await createAssociation(contractTypeId, contractId, '0-3', deal.id);
+  } catch (e) {
+    console.warn('[renewal-helper] Could not associate deal to contract:', e.message);
+  }
 
-    // Always seed from current contract recurring line items for contract-origin deals.
-    const seeded = await syncContractRecurringLineItemsToDeal(contractId, deal.id, {
-      fallbackRevenueType: 'renewal',
-    });
-    const lineItemsCreated = seeded.lineItemsCreated + seeded.lineItemsUpdated;
-    if (seeded.warnings?.length) warnings.push(...seeded.warnings);
-    console.log(
-      `[create-renewal] Synced recurring lines from contract ${contractId}: ` +
-      `${seeded.lineItemsCreated} created, ${seeded.lineItemsUpdated} updated, ` +
-      `${seeded.lineItemsRemoved} removed, ${seeded.lineItemsFailed || 0} failed ` +
-      `(source: ${seeded.inheritanceSource}, recurring source items: ${seeded.sourceRecurringCount})`
+  const contactIds = await getAssociatedIds(contractTypeId, contractId, '0-1');
+  let contactsLinked = 0;
+  for (const cid of contactIds) {
+    try {
+      await createAssociation('0-3', deal.id, '0-1', cid);
+      contactsLinked++;
+    } catch (e) {
+      console.warn(`[renewal-helper] Skipping invalid contact ${cid}:`, e.response?.data?.message || e.message);
+    }
+  }
+  if (contactIds.length > 0 && contactsLinked < contactIds.length) {
+    warnings.push(`${contactIds.length - contactsLinked} of ${contactIds.length} contact associations failed (likely deleted contacts)`);
+  }
+
+  const seeded = await syncContractRecurringLineItemsToDeal(contractId, deal.id, {
+    fallbackRevenueType: 'renewal',
+  });
+  const lineItemsCreated = seeded.lineItemsCreated + seeded.lineItemsUpdated;
+  if (seeded.warnings?.length) warnings.push(...seeded.warnings);
+
+  if (lineItemsCreated === 0) {
+    warnings.unshift(
+      `No line items were seeded on the renewal deal (source: ${seeded.inheritanceSource}). ` +
+      `Check that the contract has subscription segments with status active/future or recurring contract line items.`
     );
+  }
 
-    if (lineItemsCreated === 0) {
-      warnings.unshift(
-        `No line items were seeded on the renewal deal (source: ${seeded.inheritanceSource}). ` +
-        `Check that the contract has subscription segments with status active/future or recurring contract line items.`
-      );
+  console.log(
+    `[renewal-helper] Created renewal deal ${deal.id} for contract ${contractId}: ` +
+    `${seeded.lineItemsCreated} created, ${seeded.lineItemsUpdated} updated, ` +
+    `${seeded.lineItemsRemoved} removed, closeDate=${closeDate} ` +
+    `(${fmtDateForHS(renewalStart)} → ${fmtDateForHS(renewalEnd)})`
+  );
+
+  return {
+    success: true,
+    existing: false,
+    dealId: deal.id,
+    dealName,
+    contactsLinked,
+    lineItemsCreated,
+    lineItemsFailed: seeded.lineItemsFailed || 0,
+    inheritanceSource: seeded.inheritanceSource,
+    renewalStart: fmtDateForHS(renewalStart),
+    renewalEnd: fmtDateForHS(renewalEnd),
+    closeDate,
+    warnings,
+  };
+}
+
+// ── Route: Create Renewal Deal ───────────────────────────────────────────────
+
+app.get('/api/create-renewal-deal', async (req, res) => {
+  try {
+    const { contractId } = req.query;
+    if (!contractId) return res.status(400).json({ success: false, message: 'contractId required' });
+
+    const result = await createRenewalDealForContract(contractId, {
+      nameSuffix: 'Renewal',
+    });
+
+    if (result.existing) {
+      return res.json({
+        success: true,
+        message: `An open renewal deal already exists for this contract: ${result.dealName}. Reusing it instead of creating a duplicate.`,
+        dealId: result.dealId,
+        dealName: result.dealName,
+        existing: true,
+        warnings: result.warnings,
+      });
     }
 
     res.json({
       success: true,
-      message: lineItemsCreated > 0
-        ? `Renewal deal created with ${lineItemsCreated} line item(s): ${fmtDateForHS(renewalStart)} → ${fmtDateForHS(renewalEnd)}`
-        : `Renewal deal created (no line items seeded): ${fmtDateForHS(renewalStart)} → ${fmtDateForHS(renewalEnd)}`,
-      dealId: deal.id,
-      dealName,
-      contactsLinked,
-      lineItemsCreated,
-      lineItemsFailed: seeded.lineItemsFailed || 0,
-      inheritanceSource: seeded.inheritanceSource,
-      warnings: warnings.length > 0 ? warnings : undefined,
+      message: result.lineItemsCreated > 0
+        ? `Renewal deal created with ${result.lineItemsCreated} line item(s): ${result.renewalStart} → ${result.renewalEnd}`
+        : `Renewal deal created (no line items seeded): ${result.renewalStart} → ${result.renewalEnd}`,
+      dealId: result.dealId,
+      dealName: result.dealName,
+      contactsLinked: result.contactsLinked,
+      lineItemsCreated: result.lineItemsCreated,
+      lineItemsFailed: result.lineItemsFailed,
+      inheritanceSource: result.inheritanceSource,
+      closeDate: result.closeDate,
+      warnings: result.warnings && result.warnings.length > 0 ? result.warnings : undefined,
     });
   } catch (e) {
     console.error('[create-renewal-deal] Error:', e.response?.data || e.message);
@@ -2442,6 +2528,7 @@ app.get('/api/load-deal-cpq', async (req, res) => {
       contacts,
       portalId,
       productRegistry: PRODUCT_REGISTRY,
+      superAdminEmails: SUPER_ADMIN_EMAILS,
       isClosedWon,
     });
   } catch (e) {
@@ -2878,13 +2965,31 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
 
       const companyRollups = await syncCompanyArrForIds(companyId ? [companyId] : []);
 
+      // Per Apr 28 training: spawn the next-cycle renewal deal IMMEDIATELY on
+      // Closed Won so it lands in the forecast for the contract's end-date
+      // quarter. Only fires for new_business + renewal — amendments do NOT
+      // generate renewal deals on close.
+      let renewalDeal = null;
+      try {
+        renewalDeal = await createRenewalDealForContract(contract.id, {
+          nameSuffix: 'Renewal',
+        });
+      } catch (renewalErr) {
+        console.warn(
+          `[update-contract] Auto-renewal deal creation failed for new contract ${contract.id}:`,
+          renewalErr.response?.data?.message || renewalErr.message
+        );
+      }
+
       return res.json({
         success: true,
-        message: `New contract created with ${segmentsCreated} subscription segments and ${contractLineItems} line items`,
+        message: `New contract created with ${segmentsCreated} subscription segments and ${contractLineItems} line items`
+          + (renewalDeal?.dealId ? `; renewal deal ${renewalDeal.dealId} auto-created` : ''),
         contractId: contract.id,
         segmentsCreated,
         contractLineItems,
         companyRollups,
+        renewalDeal,
       });
     }
 
@@ -2971,14 +3076,31 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
 
         const companyRollups = await syncCompanyArrForIds(companyId ? [companyId] : []);
 
+        // Per Apr 28 training: when a renewal closes won, immediately spawn the
+        // NEXT-cycle renewal deal so the next-term forecast is populated. Close
+        // date = the new contract's end date for accurate quarterly forecasting.
+        let nextRenewalDeal = null;
+        try {
+          nextRenewalDeal = await createRenewalDealForContract(newContract.id, {
+            nameSuffix: 'Renewal',
+          });
+        } catch (renewalErr) {
+          console.warn(
+            `[update-contract] Auto-renewal deal creation failed for renewed contract ${newContract.id}:`,
+            renewalErr.response?.data?.message || renewalErr.message
+          );
+        }
+
         return res.json({
           success: true,
-          message: `Renewal contract created: ${renewalStart} → ${renewalEnd} (${segmentsCreated} segments, ${contractLineItemsCopied} line items). Old contract ${cid} expired.`,
+          message: `Renewal contract created: ${renewalStart} → ${renewalEnd} (${segmentsCreated} segments, ${contractLineItemsCopied} line items). Old contract ${cid} expired.`
+            + (nextRenewalDeal?.dealId ? ` Next-cycle renewal deal ${nextRenewalDeal.dealId} auto-created.` : ''),
           contractId: newContract.id,
           oldContractId: cid,
           segmentsCreated,
           contractLineItems: contractLineItemsCopied,
           companyRollups,
+          renewalDeal: nextRenewalDeal,
         });
       }
 
@@ -3364,6 +3486,552 @@ app.get('/api/seed-subscriptions', async (req, res) => {
   } catch (e) {
     console.error('[seed-subscriptions] Error:', e.response?.data || e.message);
     res.status(500).json({ success: false, message: e.response?.data?.message || e.message });
+  }
+});
+
+// ── Route: Sweep Contract Statuses (date-based, batch) ──────────────────────
+// Per Apr 28 training:
+//   - Migrated/historical contracts pull status directly from Salesforce
+//     `activated` field, which never re-evaluates as time passes.
+//   - This sweep walks every non-terminal contract and applies the date-based
+//     status rule (future / active / expired) so future-dated migrated contracts
+//     correctly land as `future` instead of stuck `active`.
+// Manual statuses (terminated, draft, in_approval_process) are NEVER touched.
+//
+// Optional query params:
+//   - limit (number) default 200, max 500
+//   - dryRun=true  to preview changes without writing
+
+app.get('/api/sweep-contract-statuses', async (req, res) => {
+  try {
+    await resolveTypeIds();
+    if (!contractTypeId) {
+      return res.status(500).json({ success: false, message: 'Contract schema not found' });
+    }
+
+    const requestedLimit = parseInt(req.query.limit, 10);
+    const limit = Number.isFinite(requestedLimit) && requestedLimit > 0
+      ? Math.min(requestedLimit, 500)
+      : 200;
+    const dryRun = String(req.query.dryRun || '').toLowerCase() === 'true';
+
+    const results = [];
+    let after = undefined;
+    let scanned = 0;
+    let updated = 0;
+    let skippedManual = 0;
+    let unchanged = 0;
+    let pageCount = 0;
+    const MAX_PAGES = 25;
+
+    while (pageCount < MAX_PAGES && scanned < limit) {
+      pageCount += 1;
+      const pageSize = Math.min(100, limit - scanned);
+      const body = {
+        filterGroups: [],
+        properties: ['contract_name', 'status', 'start_date', 'end_date', 'co_term_date'],
+        limit: pageSize,
+      };
+      if (after) body.after = after;
+
+      const { data } = await hs.post(`/crm/v3/objects/${contractTypeId}/search`, body);
+      const page = data.results || [];
+      if (page.length === 0) break;
+
+      for (const c of page) {
+        scanned++;
+        const cp = c.properties || {};
+        const currentStatus = cp.status || '';
+
+        // Manual statuses are not touched by date sweeps.
+        if (
+          currentStatus === 'terminated' ||
+          currentStatus === 'draft' ||
+          currentStatus === 'in_approval_process'
+        ) {
+          skippedManual++;
+          continue;
+        }
+
+        const newStatus = determineStatus(cp.start_date, getContractEndDate(cp));
+        if (!newStatus || newStatus === currentStatus) {
+          unchanged++;
+          continue;
+        }
+
+        if (!dryRun) {
+          try {
+            const updates = { status: newStatus };
+            if (newStatus === 'active' && !cp.activated_date) {
+              updates.activated_date = fmtDateForHS(new Date());
+            }
+            await updateObject(contractTypeId, c.id, updates);
+            updated++;
+          } catch (e) {
+            console.warn(`[sweep-statuses] Failed to update contract ${c.id}:`, e.response?.data?.message || e.message);
+            results.push({
+              contractId: c.id,
+              name: cp.contract_name,
+              from: currentStatus,
+              to: newStatus,
+              error: e.response?.data?.message || e.message,
+            });
+            continue;
+          }
+        } else {
+          updated++;
+        }
+
+        results.push({
+          contractId: c.id,
+          name: cp.contract_name,
+          from: currentStatus,
+          to: newStatus,
+          startDate: cp.start_date,
+          endDate: cp.end_date,
+        });
+      }
+
+      after = data.paging?.next?.after;
+      if (!after) break;
+    }
+
+    res.json({
+      success: true,
+      message: dryRun
+        ? `[dry run] Would update ${updated} contract(s) (scanned ${scanned}; ${skippedManual} skipped manual statuses; ${unchanged} unchanged)`
+        : `Updated ${updated} contract(s) (scanned ${scanned}; ${skippedManual} skipped manual statuses; ${unchanged} unchanged)`,
+      dryRun,
+      scanned,
+      updated,
+      skippedManual,
+      unchanged,
+      changes: results,
+    });
+  } catch (e) {
+    console.error('[sweep-contract-statuses] Error:', e.response?.data || e.message);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ── Route: Load Test Data (single contract) ──────────────────────────────────
+// Admin-only convenience endpoint used by the "Load Test Data" button on the
+// contract card. Wraps the seeded subscription generator so demo + sandbox
+// contracts can get realistic year-by-year segments without running a CLI.
+
+app.get('/api/load-test-data', async (req, res) => {
+  try {
+    const { contractId } = req.query;
+    if (!contractId) {
+      return res.status(400).json({ success: false, message: 'contractId required' });
+    }
+
+    await resolveTypeIds();
+    if (!contractTypeId || !subscriptionTypeId) {
+      return res.status(500).json({
+        success: false,
+        message: 'Schemas not ready — hit /api/ensure-setup first',
+      });
+    }
+
+    const contract = await getObject(contractTypeId, contractId, CONTRACT_PROPS);
+    const cp = contract.properties || {};
+
+    const existingSubIds = await getAssociatedIds(contractTypeId, contractId, subscriptionTypeId);
+    if (existingSubIds.length > 0) {
+      return res.json({
+        success: false,
+        message: `Contract already has ${existingSubIds.length} subscription segment(s). Remove them first to re-seed.`,
+        skipped: true,
+        existingCount: existingSubIds.length,
+      });
+    }
+
+    const startDate = cp.start_date || fmtDateForHS(new Date());
+    const endDate = getContractEndDate(cp)
+      || fmtDateForHS((() => { const d = parseDateValue(startDate) || new Date(); d.setFullYear(d.getFullYear() + 3); return d; })());
+
+    // 3-year LeaseQuery + 2-year FCM (matches the seed-subscriptions pattern
+    // used for the Meridian demo dataset). Year 1 LQ is intentionally
+    // `inactive` so the card has at least one historical segment to show.
+    const yearSegments = buildYearSegments(startDate, endDate);
+    if (yearSegments.length === 0) {
+      return res.status(400).json({ success: false, message: 'Could not derive year segments from contract dates' });
+    }
+
+    const cleanContractName = (cp.contract_name || 'Contract').trim() || 'Contract';
+    const companyIds = await getAssociatedIds(contractTypeId, contractId, '0-2');
+    const companyId = companyIds[0] || null;
+
+    const seedTemplates = [
+      { code: 'LQ',  name: 'LeaseQuery',                quantity: 200, unitPrice: 500, listPrice: 600, uplift: 3 },
+      { code: 'FCM', name: 'FinQuery Contract Management', quantity: 1, unitPrice: 55000, listPrice: 65000, uplift: 3 },
+    ];
+
+    const created = [];
+    for (const template of seedTemplates) {
+      for (const [yearIdx, segYear] of yearSegments.entries()) {
+        const upliftMultiplier = Math.pow(1 + (template.uplift / 100), yearIdx);
+        const unitPrice = +(template.unitPrice * upliftMultiplier).toFixed(2);
+        const annualArr = +(unitPrice * template.quantity).toFixed(2);
+        const today = fmtDateForHS(new Date());
+        let status = determineStatus(segYear.start_date, segYear.end_date);
+        if (template.code === 'LQ' && yearIdx === 0 && segYear.end_date < today) {
+          status = 'inactive';
+        }
+
+        try {
+          const seg = await createObject(subscriptionTypeId, {
+            segment_name: `${cleanContractName} — ${template.code} Year ${segYear.year}`,
+            subscription_number: `SUB-${contractId}-${template.code}-${String(segYear.year).padStart(2, '0')}`,
+            product_code: template.code,
+            product_name: template.name,
+            product_subscription_type: 'renewable',
+            subscription_type: 'renewable',
+            charge_type: 'recurring',
+            billing_frequency: 'annual',
+            status,
+            segment_year: String(segYear.year),
+            segment_label: `Year ${segYear.year}`,
+            segment_index: String(yearIdx + 1),
+            segment_uplift: yearIdx > 0 ? String(template.uplift) : undefined,
+            start_date: segYear.start_date,
+            end_date: segYear.end_date,
+            segment_start_date: segYear.start_date,
+            segment_end_date: segYear.end_date,
+            arr_start_date: segYear.start_date,
+            arr_end_date: segYear.end_date,
+            subscription_start_date: startDate,
+            subscription_end_date: endDate,
+            quantity: String(template.quantity),
+            original_quantity: String(template.quantity),
+            unit_price: String(unitPrice),
+            list_price: String(template.listPrice),
+            net_price: String(annualArr),
+            regular_price: String(unitPrice),
+            customer_price: String(unitPrice),
+            prorate_multiplier: '1',
+            pricing_method: 'list',
+            arr: String(annualArr),
+            mrr: String(+(annualArr / 12).toFixed(2)),
+            tcv: String(annualArr),
+            revenue_type: yearIdx === 0 ? 'new' : 'renewal',
+          });
+          try { await createAssociation(subscriptionTypeId, seg.id, contractTypeId, contractId); } catch (e) { /* ok */ }
+          if (companyId) {
+            try { await createAssociation(subscriptionTypeId, seg.id, '0-2', companyId); } catch (e) { /* ok */ }
+          }
+          created.push(seg.id);
+        } catch (e) {
+          console.warn(`[load-test-data] Segment create failed for ${template.code} Year ${segYear.year}:`, e.response?.data?.message || e.message);
+        }
+      }
+    }
+
+    // Refresh contract rollups so the card immediately reflects the new ARR.
+    const subs = [];
+    for (const sid of created) {
+      try { subs.push(await getObject(subscriptionTypeId, sid, SUBSCRIPTION_PROPS)); } catch (e) { /* skip */ }
+    }
+    const metrics = calcMetrics(subs);
+    await updateObject(contractTypeId, contractId, {
+      total_arr: String(metrics.total_arr),
+      total_tcv: String(metrics.total_tcv),
+      lq_arr: String(metrics.lq_arr),
+      fcm_arr: String(metrics.fcm_arr),
+      subscription_count: String(metrics.subscription_count),
+    });
+
+    res.json({
+      success: true,
+      message: `Loaded ${created.length} test subscription segment(s) across ${yearSegments.length} year(s)`,
+      contractId,
+      segmentsCreated: created.length,
+      yearsSeeded: yearSegments.length,
+      totalArr: metrics.total_arr,
+    });
+  } catch (e) {
+    console.error('[load-test-data] Error:', e.response?.data || e.message);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ── Route: Load NetSuite Test Data ───────────────────────────────────────────
+// Admin-only convenience endpoint that simulates a NetSuite sync by stamping a
+// fake NetSuite ID + billing address onto the contract. Returns synchronously
+// AFTER all writes complete so the card can refresh and immediately show the
+// new fields without a 10s polling delay (per Apr 28 bug report).
+
+app.get('/api/load-netsuite-test-data', async (req, res) => {
+  try {
+    const { contractId } = req.query;
+    if (!contractId) {
+      return res.status(400).json({ success: false, message: 'contractId required' });
+    }
+
+    await resolveTypeIds();
+    if (!contractTypeId) {
+      return res.status(500).json({ success: false, message: 'Contract schema not found' });
+    }
+
+    const contract = await getObject(contractTypeId, contractId, CONTRACT_PROPS);
+    const cp = contract.properties || {};
+
+    if (cp.netsuite_id) {
+      return res.json({
+        success: true,
+        message: `NetSuite ID already set: ${cp.netsuite_id}. Clear it first to reseed.`,
+        skipped: true,
+        netsuiteId: cp.netsuite_id,
+      });
+    }
+
+    // Deterministic fake ID so re-runs on the same contract produce the same
+    // value. NetSuite IDs are typically 6-7 digit numbers.
+    const numericContractId = String(contractId).replace(/\D/g, '') || '0';
+    const fakeNsId = String((parseInt(numericContractId.slice(-6), 10) || 100000) + 4500000);
+
+    const updates = {
+      netsuite_id: fakeNsId,
+      billing_street: cp.billing_street || '1180 Peachtree St NE',
+      billing_city: cp.billing_city || 'Atlanta',
+      billing_state: cp.billing_state || 'Georgia',
+      billing_postal_code: cp.billing_postal_code || '30309',
+      billing_country: cp.billing_country || 'United States',
+    };
+
+    // Single PATCH so the card sees all updates after the response resolves —
+    // no client-side polling needed.
+    await updateObject(contractTypeId, contractId, updates);
+
+    // Re-fetch so the response carries the post-update state. Card can use
+    // `updatedContract.properties` directly to populate UI without a follow-up
+    // load-contract call.
+    const updatedContract = await getObject(contractTypeId, contractId, CONTRACT_PROPS);
+
+    res.json({
+      success: true,
+      message: `NetSuite test data loaded: ID ${fakeNsId}`,
+      contractId,
+      netsuiteId: fakeNsId,
+      billingAddress: {
+        street: updates.billing_street,
+        city: updates.billing_city,
+        state: updates.billing_state,
+        postalCode: updates.billing_postal_code,
+        country: updates.billing_country,
+      },
+      updatedContract,
+    });
+  } catch (e) {
+    console.error('[load-netsuite-test-data] Error:', e.response?.data || e.message);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ── Route: Aggregate Contract Reports ────────────────────────────────────────
+// Cohort views over the contract object + child subscription segments. Powers
+// the Betty / Scott / Amy demo dashboards. Returns JSON ready to feed a
+// HubSpot Custom Report or a Snowflake-style export.
+//
+// Cohort buckets:
+//   - startedThisQuarter: contracts whose start_date falls in the current quarter
+//   - endingThisQuarter: contracts whose end_date falls in the current quarter
+//   - byArrBand: contracts grouped by Year 1 ARR band (<10K, 10–50K, 50–100K, 100K–250K, 250K+)
+//   - yearByYear: contracts joined to their subscription segments, summarised by segment_year
+//
+// Optional query params:
+//   - quarterStart, quarterEnd (YYYY-MM-DD) to override the current quarter window
+//   - limit (number) default 500, max 2000 — total contracts scanned
+
+app.get('/api/reports/contract-cohorts', async (req, res) => {
+  try {
+    await resolveTypeIds();
+    if (!contractTypeId) {
+      return res.status(500).json({ success: false, message: 'Contract schema not found' });
+    }
+
+    const requestedLimit = parseInt(req.query.limit, 10);
+    const totalLimit = Number.isFinite(requestedLimit) && requestedLimit > 0
+      ? Math.min(requestedLimit, 2000)
+      : 500;
+
+    // Compute the active quarter window unless overridden.
+    const today = new Date();
+    const currentQuarterStart = req.query.quarterStart
+      ? parseDateValue(req.query.quarterStart)
+      : new Date(today.getFullYear(), Math.floor(today.getMonth() / 3) * 3, 1);
+    const currentQuarterEnd = req.query.quarterEnd
+      ? parseDateValue(req.query.quarterEnd)
+      : new Date(currentQuarterStart.getFullYear(), currentQuarterStart.getMonth() + 3, 0);
+
+    const ARR_BANDS = [
+      { label: '< $10K',          min: 0,       max: 10000 },
+      { label: '$10K – $50K',     min: 10000,   max: 50000 },
+      { label: '$50K – $100K',    min: 50000,   max: 100000 },
+      { label: '$100K – $250K',   min: 100000,  max: 250000 },
+      { label: '$250K +',         min: 250000,  max: Number.POSITIVE_INFINITY },
+    ];
+
+    const arrBandSummary = ARR_BANDS.map((band) => ({
+      label: band.label,
+      contractCount: 0,
+      totalArr: 0,
+      contractIds: [],
+    }));
+
+    const startedThisQuarter = [];
+    const endingThisQuarter = [];
+    const yearByYearTotals = {}; // { [year]: { contractCount, totalArr, totalTcv, lqArr, fcmArr } }
+
+    let after = undefined;
+    let scanned = 0;
+    let pageCount = 0;
+    const MAX_PAGES = 30;
+
+    const inWindow = (dateStr, windowStart, windowEnd) => {
+      const d = parseDateValue(dateStr);
+      if (!d || !windowStart || !windowEnd) return false;
+      return d >= windowStart && d <= windowEnd;
+    };
+
+    while (pageCount < MAX_PAGES && scanned < totalLimit) {
+      pageCount += 1;
+      const pageSize = Math.min(100, totalLimit - scanned);
+      const body = {
+        filterGroups: [],
+        properties: [
+          'contract_name', 'contract_number', 'status',
+          'start_date', 'end_date', 'co_term_date',
+          'total_arr', 'total_tcv', 'lq_arr', 'fcm_arr',
+          'subscription_count',
+        ],
+        limit: pageSize,
+      };
+      if (after) body.after = after;
+
+      const { data } = await hs.post(`/crm/v3/objects/${contractTypeId}/search`, body);
+      const page = data.results || [];
+      if (page.length === 0) break;
+
+      for (const c of page) {
+        scanned++;
+        const cp = c.properties || {};
+        const totalArr = parseFloat(cp.total_arr) || 0;
+        const endDate = getContractEndDate(cp);
+
+        const summary = {
+          id: c.id,
+          name: cp.contract_name,
+          number: cp.contract_number,
+          status: cp.status,
+          startDate: cp.start_date,
+          endDate,
+          totalArr,
+          totalTcv: parseFloat(cp.total_tcv) || 0,
+          lqArr: parseFloat(cp.lq_arr) || 0,
+          fcmArr: parseFloat(cp.fcm_arr) || 0,
+        };
+
+        if (inWindow(cp.start_date, currentQuarterStart, currentQuarterEnd)) {
+          startedThisQuarter.push(summary);
+        }
+        if (inWindow(endDate, currentQuarterStart, currentQuarterEnd)) {
+          endingThisQuarter.push(summary);
+        }
+
+        const band = ARR_BANDS.findIndex((b) => totalArr >= b.min && totalArr < b.max);
+        if (band >= 0) {
+          arrBandSummary[band].contractCount += 1;
+          arrBandSummary[band].totalArr += totalArr;
+          if (arrBandSummary[band].contractIds.length < 25) {
+            arrBandSummary[band].contractIds.push(c.id);
+          }
+        }
+      }
+
+      after = data.paging?.next?.after;
+      if (!after) break;
+    }
+
+    // Year-by-year summary requires walking subscription segments. Cap the
+    // contracts we drill into so a portal with thousands of contracts does
+    // not blow the 30s Railway request budget. Prefer the contracts we have
+    // already loaded via the cohort scans.
+    const drillContractIds = Array.from(new Set([
+      ...startedThisQuarter.map((c) => c.id),
+      ...endingThisQuarter.map((c) => c.id),
+    ])).slice(0, 100);
+
+    if (subscriptionTypeId && drillContractIds.length > 0) {
+      for (const cid of drillContractIds) {
+        try {
+          const subIds = await getAssociatedIds(contractTypeId, cid, subscriptionTypeId);
+          if (subIds.length === 0) continue;
+          const subs = await Promise.all(
+            subIds.map((id) =>
+              getObject(subscriptionTypeId, id, [
+                'segment_year', 'arr', 'tcv', 'product_code', 'status',
+              ])
+            )
+          );
+          for (const sub of subs) {
+            const sp = sub.properties || {};
+            if (sp.status === 'terminated') continue;
+            const year = parseInt(sp.segment_year, 10) || 1;
+            const arr = parseFloat(sp.arr) || 0;
+            const tcv = parseFloat(sp.tcv) || 0;
+            const code = (sp.product_code || '').toUpperCase();
+
+            if (!yearByYearTotals[year]) {
+              yearByYearTotals[year] = {
+                year,
+                segmentCount: 0,
+                totalArr: 0,
+                totalTcv: 0,
+                lqArr: 0,
+                fcmArr: 0,
+              };
+            }
+            yearByYearTotals[year].segmentCount += 1;
+            yearByYearTotals[year].totalArr += arr;
+            yearByYearTotals[year].totalTcv += tcv;
+            if (code === 'LQ') yearByYearTotals[year].lqArr += arr;
+            if (code === 'FCM') yearByYearTotals[year].fcmArr += arr;
+          }
+        } catch (e) {
+          console.warn(`[reports] Year-by-year drill failed for contract ${cid}:`, e.message);
+        }
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `Aggregated ${scanned} contract(s) (drilled ${drillContractIds.length} for year-by-year)`,
+      generatedAt: new Date().toISOString(),
+      window: {
+        quarterStart: fmtDateForHS(currentQuarterStart),
+        quarterEnd: fmtDateForHS(currentQuarterEnd),
+      },
+      cohorts: {
+        startedThisQuarter: {
+          count: startedThisQuarter.length,
+          totalArr: startedThisQuarter.reduce((s, c) => s + c.totalArr, 0),
+          contracts: startedThisQuarter,
+        },
+        endingThisQuarter: {
+          count: endingThisQuarter.length,
+          totalArr: endingThisQuarter.reduce((s, c) => s + c.totalArr, 0),
+          contracts: endingThisQuarter,
+        },
+        byArrBand: arrBandSummary,
+        yearByYear: Object.values(yearByYearTotals).sort((a, b) => a.year - b.year),
+      },
+      scanned,
+    });
+  } catch (e) {
+    console.error('[reports/contract-cohorts] Error:', e.response?.data || e.message);
+    res.status(500).json({ success: false, message: e.message });
   }
 });
 
