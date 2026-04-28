@@ -23,8 +23,11 @@ const hs = axios.create({
 // ── Product Registry ─────────────────────────────────────────────────────────
 const PRODUCT_REGISTRY = {
   LQ:  { code: 'LQ',  name: 'LeaseQuery',                category: 'core', arrField: 'lq_arr' },
-  FCM: { code: 'FCM', name: 'Financial Close Management', category: 'core', arrField: 'fcm_arr' },
+  FCM: { code: 'FCM', name: 'FinQuery Contract Management', category: 'core', arrField: 'fcm_arr' },
 };
+
+// Prevent slow card loads on contracts with very large deal histories.
+const CARD_DEAL_LOAD_LIMIT = 10;
 
 // ── Type ID Cache ────────────────────────────────────────────────────────────
 let contractTypeId = null;
@@ -362,7 +365,6 @@ const DEAL_PROPERTIES = [
     options: [
       { label: 'New Business', value: 'new_business' },
       { label: 'Renewal', value: 'renewal' },
-      { label: 'Amendment', value: 'amendment' },
       { label: 'Expansion', value: 'expansion' },
       { label: 'Contraction', value: 'contraction' },
     ],
@@ -588,11 +590,50 @@ function fmtDateForHS(d) {
   return dt.toISOString().split('T')[0];
 }
 
+function parseDateValue(value) {
+  if (!value) return null;
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : new Date(value);
+  }
+  if (typeof value === 'number') {
+    const d = new Date(value);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+
+    // HubSpot date-only fields are "YYYY-MM-DD"; parse in local time to avoid
+    // timezone-driven day shifts (e.g., 3/16 rendering as 3/15).
+    const ymd = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (ymd) {
+      const y = Number(ymd[1]);
+      const m = Number(ymd[2]) - 1;
+      const d = Number(ymd[3]);
+      const parsed = new Date(y, m, d);
+      return Number.isNaN(parsed.getTime()) ? null : parsed;
+    }
+
+    if (/^\d+$/.test(trimmed)) {
+      const d = new Date(Number(trimmed));
+      return Number.isNaN(d.getTime()) ? null : d;
+    }
+
+    const parsed = new Date(trimmed);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  }
+  return null;
+}
+
+function getContractEndDate(props = {}) {
+  return props.end_date || props.co_term_date || null;
+}
+
 function determineStatus(startDate, endDate) {
   const now = new Date();
   now.setHours(0, 0, 0, 0);
-  const start = startDate ? new Date(startDate) : null;
-  const end = endDate ? new Date(endDate) : null;
+  const start = parseDateValue(startDate);
+  const end = parseDateValue(endDate);
   if (start) start.setHours(0, 0, 0, 0);
   if (end) end.setHours(0, 0, 0, 0);
 
@@ -602,19 +643,92 @@ function determineStatus(startDate, endDate) {
   return 'expired';
 }
 
-function calcMetrics(subscriptions) {
-  const metrics = { total_arr: 0, total_tcv: 0, lq_arr: 0, fcm_arr: 0, subscription_count: subscriptions.length };
+function toMidnight(value) {
+  const d = parseDateValue(value);
+  if (!d) return null;
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function chooseCurrentSegmentYear(subscriptions) {
+  const today = toMidnight(new Date());
+  const byYear = new Map();
+
   for (const sub of subscriptions) {
     const sp = sub.properties || {};
     if (sp.status === 'terminated') continue;
+    const year = parseInt(sp.segment_year, 10) || 1;
+    if (!byYear.has(year)) {
+      byYear.set(year, {
+        year,
+        arr: 0,
+        tcv: 0,
+        lqArr: 0,
+        fcmArr: 0,
+        earliestStart: null,
+        latestEnd: null,
+      });
+    }
+    const bucket = byYear.get(year);
     const arr = parseFloat(sp.arr) || 0;
     const tcv = parseFloat(sp.tcv) || 0;
-    metrics.total_arr += arr;
-    metrics.total_tcv += tcv;
     const code = (sp.product_code || '').toUpperCase();
-    if (code === 'LQ') metrics.lq_arr += arr;
-    if (code === 'FCM') metrics.fcm_arr += arr;
+    const start = toMidnight(sp.start_date || sp.segment_start_date);
+    const end = toMidnight(sp.end_date || sp.segment_end_date);
+
+    bucket.arr += arr;
+    bucket.tcv += tcv;
+    if (code === 'LQ') bucket.lqArr += arr;
+    if (code === 'FCM') bucket.fcmArr += arr;
+
+    if (start && (!bucket.earliestStart || start < bucket.earliestStart)) {
+      bucket.earliestStart = start;
+    }
+    if (end && (!bucket.latestEnd || end > bucket.latestEnd)) {
+      bucket.latestEnd = end;
+    }
   }
+
+  if (byYear.size === 0) return null;
+
+  const years = Array.from(byYear.values()).sort((a, b) => a.year - b.year);
+  const active = years.find((y) => {
+    const hasStarted = !y.earliestStart || y.earliestStart <= today;
+    const notEnded = !y.latestEnd || y.latestEnd >= today;
+    return hasStarted && notEnded;
+  });
+  if (active) return active;
+
+  const past = years
+    .filter((y) => y.latestEnd && y.latestEnd < today)
+    .sort((a, b) => b.latestEnd - a.latestEnd);
+  if (past.length > 0) return past[0];
+
+  const future = years
+    .filter((y) => y.earliestStart && y.earliestStart > today)
+    .sort((a, b) => a.earliestStart - b.earliestStart);
+  if (future.length > 0) return future[0];
+
+  return years[0];
+}
+
+function calcMetrics(subscriptions) {
+  const metrics = { total_arr: 0, total_tcv: 0, lq_arr: 0, fcm_arr: 0, subscription_count: subscriptions.length };
+  const currentSegment = chooseCurrentSegmentYear(subscriptions);
+
+  for (const sub of subscriptions) {
+    const sp = sub.properties || {};
+    if (sp.status === 'terminated') continue;
+    const tcv = parseFloat(sp.tcv) || 0;
+    metrics.total_tcv += tcv;
+  }
+
+  if (currentSegment) {
+    metrics.total_arr = currentSegment.arr;
+    metrics.lq_arr = currentSegment.lqArr;
+    metrics.fcm_arr = currentSegment.fcmArr;
+  }
+
   return metrics;
 }
 
@@ -670,7 +784,7 @@ function buildInheritedProductDescription(baseDescription, productKey) {
 
 function normalizeRecurringPeriod(periodRaw) {
   const period = String(periodRaw || '').trim();
-  if (!period) return 'P12M';
+  if (!period) return null;
   const lower = period.toLowerCase();
   if (lower === 'one_time' || lower === 'onetime') return null;
   if (lower === 'annual') return 'P12M';
@@ -726,23 +840,181 @@ async function updateLineItemWithFallback(lineItemId, properties) {
 
 async function syncContractRecurringLineItemsToDeal(contractId, dealId, options = {}) {
   const { fallbackRevenueType = 'renewal' } = options;
+  const warnings = [];
+  let recurringSourceItems = [];
+  let inheritanceSource = 'none';
 
-  const sourceLineItemIds = await getAssociatedIds(contractTypeId, contractId, 'line_items');
-  const sourceItems = sourceLineItemIds.length === 0
-    ? []
-    : await Promise.all(
-      sourceLineItemIds.map((id) =>
-        getObject('line_items', id, [
-          'name', 'quantity', 'price', 'hs_sku', 'description',
-          'hs_recurring_billing_period', 'revenue_type',
-        ])
-      )
+  // Primary source: subscription segments (renewal/amendment model of record).
+  if (subscriptionTypeId) {
+    const subIds = await getAssociatedIds(contractTypeId, contractId, subscriptionTypeId);
+    console.log(
+      `[sync-contract-lines] Contract ${contractId}: found ${subIds.length} associated subscription segment(s)`
     );
+    if (subIds.length > 0) {
+      const subRecords = await Promise.all(
+        subIds.map((id) =>
+          getObject(subscriptionTypeId, id, [
+            'status',
+            'product_name',
+            'product_code',
+            'quantity',
+            'original_quantity',
+            'renewal_quantity',
+            'unit_price',
+            'arr',
+            'mrr',
+            'billing_frequency',
+            'revenue_type',
+            'segment_year',
+            'arr_end_date',
+            'end_date',
+          ])
+        )
+      );
 
-  const recurringSourceItems = sourceItems.filter((item) => {
-    const period = normalizeRecurringPeriod(item?.properties?.hs_recurring_billing_period);
-    return !!period;
-  });
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+
+      const isStillRunning = (sub) => {
+        const p = sub?.properties || {};
+        const endRaw = p.arr_end_date || p.end_date;
+        const endDate = parseDateValue(endRaw);
+        if (!endDate) return true; // unknown end date -> assume still active
+        return endDate >= today;
+      };
+
+      const statusCounts = {};
+      subRecords.forEach((sub) => {
+        const s = String(sub?.properties?.status || '').toLowerCase().trim() || '(empty)';
+        statusCounts[s] = (statusCounts[s] || 0) + 1;
+      });
+      console.log(
+        `[sync-contract-lines] Contract ${contractId}: subscription status breakdown: ${JSON.stringify(statusCounts)}`
+      );
+
+      const isInheritableStatus = (sub) => {
+        const status = String(sub?.properties?.status || '').toLowerCase().trim();
+        if (status === 'active' || status === 'future') return true;
+        // Treat blank status as inheritable when the segment is still running. This
+        // catches imported/legacy segments that never had the status field populated.
+        if (!status && isStillRunning(sub)) return true;
+        return false;
+      };
+
+      let inheritableSubs = subRecords.filter(isInheritableStatus);
+
+      // Defensive fallback: if no segments matched the status filter but there are
+      // still segments whose end date is today or later, inherit those instead of
+      // returning an empty deal. Renewals on imported contracts often have legacy
+      // status values and we'd rather seed line items than ship an empty deal.
+      if (inheritableSubs.length === 0) {
+        const stillRunning = subRecords.filter(isStillRunning);
+        if (stillRunning.length > 0) {
+          warnings.push(
+            `No subscription segments had an active/future status; inheriting ${stillRunning.length} still-running segment(s) by date instead.`
+          );
+          console.warn(
+            `[sync-contract-lines] Contract ${contractId}: status filter matched 0 segments. ` +
+            `Falling back to ${stillRunning.length} still-running segment(s) based on end date.`
+          );
+          inheritableSubs = stillRunning;
+        }
+      }
+
+      if (inheritableSubs.length > 0) {
+        const billingFrequencyToPeriod = (billingFrequencyRaw) => {
+          const value = String(billingFrequencyRaw || '').trim().toLowerCase();
+          if (value === 'monthly') return 'P1M';
+          if (value === 'quarterly') return 'P3M';
+          if (value === 'semi-annual' || value === 'semi_annual') return 'P6M';
+          if (value === 'annual' || value === 'yearly') return 'P12M';
+          return 'P12M';
+        };
+
+        recurringSourceItems = inheritableSubs.map((sub, index) => {
+          const p = sub.properties || {};
+          const quantity = Number(p.renewal_quantity || p.quantity || p.original_quantity || 1) || 1;
+          const unitPriceFromField = Number(p.unit_price || 0) || 0;
+          const arr = Number(p.arr || 0) || 0;
+          const mrr = Number(p.mrr || 0) || 0;
+          const annualAmount = arr > 0 ? arr : (mrr > 0 ? mrr * 12 : 0);
+          const computedUnitPrice = unitPriceFromField > 0
+            ? unitPriceFromField
+            : (quantity > 0 ? annualAmount / quantity : annualAmount);
+
+          return {
+            id: sub.id || `fallback-sub-${index + 1}`,
+            properties: {
+              name: p.product_name || p.product_code || `Subscription ${index + 1}`,
+              quantity: String(quantity > 0 ? quantity : 1),
+              price: String(Math.max(0, computedUnitPrice || 0)),
+              hs_sku: p.product_code || '',
+              description: '',
+              hs_recurring_billing_period: billingFrequencyToPeriod(p.billing_frequency),
+              revenue_type: p.revenue_type || fallbackRevenueType,
+            },
+          };
+        });
+        inheritanceSource = 'subscription_segments';
+      } else {
+        warnings.push('No active/future/still-running subscription segments found; falling back to contract line items');
+      }
+    } else {
+      warnings.push('No subscription segments associated; falling back to contract line items');
+    }
+  } else {
+    console.warn(
+      `[sync-contract-lines] subscriptionTypeId is not resolved; falling back to contract line items for contract ${contractId}`
+    );
+    warnings.push('Subscription schema not resolved; falling back to contract line items');
+  }
+
+  // Legacy fallback: use recurring contract line items only when no subscription source is available.
+  if (recurringSourceItems.length === 0) {
+    const sourceLineItemIds = await getAssociatedIds(contractTypeId, contractId, 'line_items');
+    console.log(
+      `[sync-contract-lines] Contract ${contractId}: legacy fallback -> ${sourceLineItemIds.length} contract line item(s) found`
+    );
+    const sourceItems = sourceLineItemIds.length === 0
+      ? []
+      : await Promise.all(
+        sourceLineItemIds.map((id) =>
+          getObject('line_items', id, [
+            'name', 'quantity', 'price', 'hs_sku', 'description',
+            'hs_recurring_billing_period', 'revenue_type',
+          ])
+        )
+      );
+
+    recurringSourceItems = sourceItems.filter((item) => {
+      const period = normalizeRecurringPeriod(item?.properties?.hs_recurring_billing_period);
+      return !!period;
+    });
+
+    if (recurringSourceItems.length > 0) {
+      warnings.push(`Used ${recurringSourceItems.length} recurring contract line items as fallback`);
+      inheritanceSource = 'contract_line_items';
+    }
+  }
+
+  if (recurringSourceItems.length === 0) {
+    warnings.push('No inheritable recurring source items were found on subscriptions or contract line items');
+    console.warn(
+      `[sync-contract-lines] Contract ${contractId}: NOTHING to inherit (no subscriptions matched and no recurring line items found). Renewal deal will have zero line items.`
+    );
+    return {
+      sourceRecurringCount: 0,
+      lineItemsCreated: 0,
+      lineItemsUpdated: 0,
+      lineItemsRemoved: 0,
+      inheritanceSource,
+      warnings,
+    };
+  }
+
+  console.log(
+    `[sync-contract-lines] Contract ${contractId}: inheriting ${recurringSourceItems.length} recurring item(s) from ${inheritanceSource}`
+  );
 
   const groupedByProduct = {};
   recurringSourceItems.forEach((item, index) => {
@@ -803,8 +1075,7 @@ async function syncContractRecurringLineItemsToDeal(contractId, dealId, options 
   let created = 0;
   let updated = 0;
   let removed = 0;
-  const warnings = [];
-
+  let failed = 0;
   const incomingKeySet = new Set();
 
   groupedItems.forEach((item) => incomingKeySet.add(item.key));
@@ -838,9 +1109,11 @@ async function syncContractRecurringLineItemsToDeal(contractId, dealId, options 
         created++;
       }
     } catch (e) {
+      failed++;
       const lineName = item.name || item.key;
-      warnings.push(`Failed syncing ${lineName}`);
-      console.warn('[sync-contract-lines] Failed line sync:', lineName, e.response?.data?.message || e.message);
+      const detail = e.response?.data?.message || e.message;
+      warnings.push(`Failed syncing line item "${lineName}": ${detail}`);
+      console.error('[sync-contract-lines] Failed line sync:', lineName, e.response?.data || e.message);
     }
   }
 
@@ -860,6 +1133,8 @@ async function syncContractRecurringLineItemsToDeal(contractId, dealId, options 
     lineItemsCreated: created,
     lineItemsUpdated: updated,
     lineItemsRemoved: removed,
+    lineItemsFailed: failed,
+    inheritanceSource,
     warnings,
   };
 }
@@ -1065,6 +1340,33 @@ app.get('/api/load-contract', async (req, res) => {
       }
     }
 
+    const metrics = calcMetrics(subscriptions);
+    const contractProps = contract.properties || {};
+    const shouldUpdateRollups =
+      (parseFloat(contractProps.total_arr) || 0) !== metrics.total_arr ||
+      (parseFloat(contractProps.total_tcv) || 0) !== metrics.total_tcv ||
+      (parseFloat(contractProps.lq_arr) || 0) !== metrics.lq_arr ||
+      (parseFloat(contractProps.fcm_arr) || 0) !== metrics.fcm_arr ||
+      (parseInt(contractProps.subscription_count, 10) || 0) !== metrics.subscription_count;
+
+    if (shouldUpdateRollups) {
+      await updateObject(contractTypeId, contractId, {
+        total_arr: String(metrics.total_arr),
+        total_tcv: String(metrics.total_tcv),
+        lq_arr: String(metrics.lq_arr),
+        fcm_arr: String(metrics.fcm_arr),
+        subscription_count: String(metrics.subscription_count),
+      });
+      contract.properties = {
+        ...contractProps,
+        total_arr: String(metrics.total_arr),
+        total_tcv: String(metrics.total_tcv),
+        lq_arr: String(metrics.lq_arr),
+        fcm_arr: String(metrics.fcm_arr),
+        subscription_count: String(metrics.subscription_count),
+      };
+    }
+
     const companyIds = await getAssociatedIds(contractTypeId, contractId, '0-2');
     let company = null;
     if (companyIds.length > 0) {
@@ -1074,20 +1376,34 @@ app.get('/api/load-contract', async (req, res) => {
     }
 
     const dealIds = await getAssociatedIds(contractTypeId, contractId, '0-3');
+    const dealsMeta = {
+      totalAssociatedDeals: dealIds.length,
+      loadedDealsCount: 0,
+      loadSkipped: false,
+      loadLimit: CARD_DEAL_LOAD_LIMIT,
+    };
     const deals = [];
-    for (const did of dealIds) {
-      try {
-        const d = await getObject('0-3', did, ['dealname', 'dealstage', 'amount', 'closedate', 'deal_category', 'pipeline']);
+    if (dealIds.length > CARD_DEAL_LOAD_LIMIT) {
+      dealsMeta.loadSkipped = true;
+      console.log(`[load-contract] Skipping deal payload for contract ${contractId}. Associated deals: ${dealIds.length}, limit: ${CARD_DEAL_LOAD_LIMIT}`);
+    } else if (dealIds.length > 0) {
+      const dealFetches = dealIds.map((did) => getObject('0-3', did, ['dealname', 'dealstage', 'amount', 'closedate', 'deal_category', 'pipeline']));
+      const dealResults = await Promise.allSettled(dealFetches);
+      for (const result of dealResults) {
+        if (result.status !== 'fulfilled') continue;
+        const d = result.value;
         deals.push({
           id: d.id,
           name: d.properties.dealname,
           stage: d.properties.dealstage,
           amount: d.properties.amount,
+          arr: d.properties.amount,
           closeDate: d.properties.closedate,
           category: d.properties.deal_category,
           pipeline: d.properties.pipeline,
         });
-      } catch (e) { /* skip inaccessible deals */ }
+      }
+      dealsMeta.loadedDealsCount = deals.length;
     }
 
     const contactIds = await getAssociatedIds(contractTypeId, contractId, '0-1');
@@ -1116,6 +1432,7 @@ app.get('/api/load-contract', async (req, res) => {
       subscriptions,
       company,
       deals,
+      dealsMeta,
       contacts,
       portalId,
       productRegistry: PRODUCT_REGISTRY,
@@ -1144,7 +1461,7 @@ app.get('/api/start-amendment', async (req, res) => {
       dealname: dealName,
       dealstage: 'appointmentscheduled',
       contract_start_date: startDate || fmtDateForHS(new Date()),
-      contract_end_date: props.end_date || null,
+      contract_end_date: getContractEndDate(props),
       pipeline: 'default',
     };
 
@@ -1227,6 +1544,9 @@ app.get('/api/terminate-contract', async (req, res) => {
       status: 'terminated',
       terminated_date: fmtDateForHS(new Date()),
       termination_reason: reason || 'manual',
+      total_arr: '0',
+      lq_arr: '0',
+      fcm_arr: '0',
     });
 
     if (subscriptionTypeId) {
@@ -1326,13 +1646,46 @@ app.get('/api/create-renewal-deal', async (req, res) => {
     const contract = await getObject(contractTypeId, contractId, CONTRACT_PROPS);
     const props = contract.properties;
 
-    const currentEnd = props.end_date ? new Date(props.end_date) : new Date();
+    const currentEnd = parseDateValue(getContractEndDate(props)) || new Date();
     const renewalStart = new Date(currentEnd);
     renewalStart.setDate(renewalStart.getDate() + 1);
     const renewalEnd = new Date(renewalStart);
     renewalEnd.setFullYear(renewalEnd.getFullYear() + 1);
 
     const dealName = `${props.contract_name || 'Contract'} — Renewal`;
+
+    // Idempotency: if there's already an OPEN renewal deal associated to this contract,
+    // return it instead of creating a duplicate. This prevents accidental duplicates
+    // from rapid double-clicks or client retries on slow responses.
+    const existingDealIds = await getAssociatedIds(contractTypeId, contractId, '0-3');
+    if (existingDealIds.length > 0) {
+      const existingDeals = await Promise.allSettled(
+        existingDealIds.map((id) =>
+          getObject('0-3', id, ['dealname', 'dealstage', 'deal_category', 'amount', 'closedate'])
+        )
+      );
+      const openRenewal = existingDeals
+        .filter((r) => r.status === 'fulfilled')
+        .map((r) => r.value)
+        .find((d) => {
+          const category = String(d?.properties?.deal_category || '').toLowerCase();
+          const stage = String(d?.properties?.dealstage || '').toLowerCase();
+          return category === 'renewal' && stage !== 'closedwon' && stage !== 'closedlost';
+        });
+      if (openRenewal) {
+        console.log(
+          `[create-renewal] Open renewal deal already exists for contract ${contractId}: ${openRenewal.id}. Returning existing deal.`
+        );
+        return res.json({
+          success: true,
+          message: `An open renewal deal already exists for this contract: ${openRenewal.properties?.dealname || openRenewal.id}. Reusing it instead of creating a duplicate.`,
+          dealId: openRenewal.id,
+          dealName: openRenewal.properties?.dealname || dealName,
+          existing: true,
+          warnings: ['An open renewal deal already existed; no new deal was created.'],
+        });
+      }
+    }
 
     const deal = await createObject('0-3', {
       dealname: dealName,
@@ -1384,17 +1737,29 @@ app.get('/api/create-renewal-deal', async (req, res) => {
     if (seeded.warnings?.length) warnings.push(...seeded.warnings);
     console.log(
       `[create-renewal] Synced recurring lines from contract ${contractId}: ` +
-      `${seeded.lineItemsCreated} created, ${seeded.lineItemsUpdated} updated, ${seeded.lineItemsRemoved} removed ` +
-      `(source recurring: ${seeded.sourceRecurringCount})`
+      `${seeded.lineItemsCreated} created, ${seeded.lineItemsUpdated} updated, ` +
+      `${seeded.lineItemsRemoved} removed, ${seeded.lineItemsFailed || 0} failed ` +
+      `(source: ${seeded.inheritanceSource}, recurring source items: ${seeded.sourceRecurringCount})`
     );
+
+    if (lineItemsCreated === 0) {
+      warnings.unshift(
+        `No line items were seeded on the renewal deal (source: ${seeded.inheritanceSource}). ` +
+        `Check that the contract has subscription segments with status active/future or recurring contract line items.`
+      );
+    }
 
     res.json({
       success: true,
-      message: `Renewal deal created: ${fmtDateForHS(renewalStart)} → ${fmtDateForHS(renewalEnd)}`,
+      message: lineItemsCreated > 0
+        ? `Renewal deal created with ${lineItemsCreated} line item(s): ${fmtDateForHS(renewalStart)} → ${fmtDateForHS(renewalEnd)}`
+        : `Renewal deal created (no line items seeded): ${fmtDateForHS(renewalStart)} → ${fmtDateForHS(renewalEnd)}`,
       dealId: deal.id,
       dealName,
       contactsLinked,
       lineItemsCreated,
+      lineItemsFailed: seeded.lineItemsFailed || 0,
+      inheritanceSource: seeded.inheritanceSource,
       warnings: warnings.length > 0 ? warnings : undefined,
     });
   } catch (e) {
@@ -1452,7 +1817,7 @@ app.get('/api/trigger-auto-renewal', async (req, res) => {
       return res.json({ success: true, message: 'Auto-renewal already released', alreadyReleased: true });
     }
 
-    const currentEnd = props.end_date ? new Date(props.end_date) : new Date();
+    const currentEnd = parseDateValue(getContractEndDate(props)) || new Date();
     const renewalStart = new Date(currentEnd);
     renewalStart.setDate(renewalStart.getDate() + 1);
     const renewalEnd = new Date(renewalStart);
@@ -1536,7 +1901,7 @@ app.get('/api/check-auto-renewals', async (req, res) => {
           { propertyName: 'status', operator: 'IN', values: ['active', 'future'] },
         ],
       }],
-      properties: ['contract_name', 'auto_renewal_date', 'auto_renewal_released', 'status', 'end_date', 'total_arr'],
+      properties: ['contract_name', 'auto_renewal_date', 'auto_renewal_released', 'status', 'end_date', 'co_term_date', 'total_arr'],
       limit: 100,
     });
 
@@ -1548,7 +1913,7 @@ app.get('/api/check-auto-renewals', async (req, res) => {
     for (const c of candidates) {
       try {
         const cp = c.properties;
-        const currentEnd = cp.end_date ? new Date(cp.end_date) : new Date();
+        const currentEnd = parseDateValue(getContractEndDate(cp)) || new Date();
         const renewalStart = new Date(currentEnd);
         renewalStart.setDate(renewalStart.getDate() + 1);
         const renewalEnd = new Date(renewalStart);
@@ -1787,6 +2152,7 @@ app.get('/api/load-company-contracts', async (req, res) => {
             }
           }
         }
+
         const mrr = arr / 12;
 
         ltv += tcv;
@@ -1814,8 +2180,8 @@ app.get('/api/load-company-contracts', async (req, res) => {
           arr,
           mrr,
           tcv,
-          startDate: cp.start_date,
-          endDate: cp.end_date,
+          startDate: cp.start_date || null,
+          endDate: cp.end_date || cp.co_term_date || null,
           coTermDate: cp.co_term_date,
           term: parseInt(cp.contract_term) || null,
           renewalTerm: parseInt(cp.renewal_term) || null,
@@ -2002,10 +2368,13 @@ app.post('/api/upsert-demo-line-items', async (req, res) => {
 
     const normalizedProducts = productItems
       .map((item, index) => {
-        const key = sanitizeKey(
+        const year = parseInt(item?.year, 10);
+        const safeYear = Number.isFinite(year) && year > 0 ? year : null;
+        const baseKey = sanitizeKey(
           item?.key || item?.productCode || item?.productName,
           `product-${index + 1}`
         );
+        const key = safeYear ? `${baseKey}-y${safeYear}` : baseKey;
         const quantity = Math.max(0, parseFloat(item?.quantity) || 0);
         const netArr = Math.max(0, parseFloat(item?.netArr) || 0);
         const unitPrice =
@@ -2019,6 +2388,7 @@ app.post('/api/upsert-demo-line-items', async (req, res) => {
           quantity,
           unitPrice,
           netArr,
+          year: safeYear,
           revenueType: normalizeRevenueType(item?.revenueType),
           startDate: fmtDateForHS(item?.startDate),
         };
@@ -2087,7 +2457,7 @@ app.post('/api/upsert-demo-line-items', async (req, res) => {
         price: toPriceString(unitPrice),
         hs_sku: item.productCode || `DEMO-${item.key.toUpperCase()}`,
         hs_recurring_billing_period: 'P12M',
-        description: `FinQuery CPQ demo line item | FQ_DEMO_PRODUCT_KEY:${item.key}`,
+        description: `FinQuery CPQ demo line item | FQ_DEMO_PRODUCT_KEY:${item.key}${item.year ? ` | FQ_DEMO_YEAR:${item.year}` : ''}`,
         revenue_type: item.revenueType,
       };
 
@@ -2120,7 +2490,7 @@ app.post('/api/upsert-demo-line-items', async (req, res) => {
 
     res.json({
       success: true,
-      message: `Demo product line items synced (${created} created, ${updated} updated, ${removed} removed)`,
+      message: `Demo product/year line items synced (${created} created, ${updated} updated, ${removed} removed)`,
       created,
       updated,
       removed,
@@ -2462,7 +2832,7 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
         const companyId = companyIds.length > 0 ? companyIds[0] : null;
 
         const amendStartDate = dp.contract_start_date || cp.amendment_start_date || fmtDateForHS(new Date());
-        const amendEndDate = dp.contract_end_date || cp.end_date;
+        const amendEndDate = dp.contract_end_date || getContractEndDate(cp);
 
         let segmentsCreated = 0;
         let contractLineItemsCopied = 0;
@@ -2741,7 +3111,7 @@ app.get('/api/seed-subscriptions', async (req, res) => {
           segment_name: `${contractName} — FCM Year 1`,
           subscription_number: `SUB-${cId}-FCM-01`,
           product_code: 'FCM',
-          product_name: 'Financial Close Management',
+          product_name: 'FinQuery Contract Management',
           product_subscription_type: 'renewable',
           subscription_type: 'renewable',
           charge_type: 'recurring',
@@ -2776,7 +3146,7 @@ app.get('/api/seed-subscriptions', async (req, res) => {
           segment_name: `${contractName} — FCM Year 2`,
           subscription_number: `SUB-${cId}-FCM-02`,
           product_code: 'FCM',
-          product_name: 'Financial Close Management',
+          product_name: 'FinQuery Contract Management',
           product_subscription_type: 'renewable',
           subscription_type: 'renewable',
           charge_type: 'recurring',
