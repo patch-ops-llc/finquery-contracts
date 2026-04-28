@@ -643,6 +643,67 @@ function determineStatus(startDate, endDate) {
   return 'expired';
 }
 
+function addDaysToDate(dateObj, days) {
+  const d = new Date(dateObj);
+  d.setDate(d.getDate() + days);
+  return d;
+}
+
+// Splits a [start, end] contract span into 12-month segment buckets:
+// Year 1 = [start, start+1y-1d], Year 2 = [start+1y, start+2y-1d], ... with the
+// last segment truncated to `end`. Returns [{ year, start_date, end_date }].
+function buildYearSegments(startDateStr, endDateStr) {
+  const start = parseDateValue(startDateStr);
+  const end = parseDateValue(endDateStr);
+  if (!start || !end || start > end) {
+    return [{ year: 1, start_date: startDateStr, end_date: endDateStr }];
+  }
+
+  const segments = [];
+  let currentStart = new Date(start);
+  let segmentYear = 1;
+
+  while (currentStart <= end) {
+    const nextYearStart = new Date(currentStart);
+    nextYearStart.setFullYear(nextYearStart.getFullYear() + 1);
+    const candidateEnd = addDaysToDate(nextYearStart, -1);
+    const currentEnd = candidateEnd > end ? new Date(end) : candidateEnd;
+
+    segments.push({
+      year: segmentYear,
+      start_date: fmtDateForHS(currentStart),
+      end_date: fmtDateForHS(currentEnd),
+    });
+
+    if (currentEnd >= end) break;
+    currentStart = addDaysToDate(currentEnd, 1);
+    segmentYear += 1;
+  }
+
+  return segments;
+}
+
+// Derive a short product code for segment_name / product_code from a line item.
+// Prefers the head of hs_sku (e.g. "LQ-CORE" -> "LQ"); falls back to initials of
+// the product name.
+function deriveProductCode(lineItemProps = {}) {
+  const sku = String(lineItemProps.hs_sku || '').trim();
+  if (sku) {
+    const head = sku.toUpperCase().split(/[-_\s]/)[0];
+    if (head) return head;
+    return sku.toUpperCase();
+  }
+  const name = String(lineItemProps.name || '').trim();
+  if (!name) return 'PRODUCT';
+  const initials = name
+    .split(/\s+/)
+    .map((w) => w[0])
+    .filter(Boolean)
+    .join('')
+    .toUpperCase();
+  return (initials || name).slice(0, 16);
+}
+
 function toMidnight(value) {
   const d = parseDateValue(value);
   if (!d) return null;
@@ -2560,6 +2621,10 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
     }
 
     // ── Helper: create subscription segments from recurring line items ─
+    // Creates ONE segment per recurring line item per contract year. One-time
+    // line items live on the contract as line items only -- they are NOT
+    // segments. Multi-year contracts get N segments per recurring product (one
+    // per year), matching the seed pattern (e.g. "LQ Year 1", "LQ Year 2").
     async function createSegmentsFromLineItems(cId, lineItems, opts = {}) {
       const {
         startDate,
@@ -2568,67 +2633,86 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
         amendmentIndicator,
         dealCategory,
         companyId,
+        contractName,
       } = opts;
 
       const recurringItems = lineItems.filter(isRecurringLineItem);
+      const yearSegments = buildYearSegments(startDate, endDate);
+      const cleanContractName = String(contractName || 'Contract').trim() || 'Contract';
       let created = 0;
       let totalArr = 0;
 
-      for (const li of recurringItems) {
+      for (const [liIndex, li] of recurringItems.entries()) {
         const lp = li.properties || {};
         const qty = parseInt(lp.quantity) || 1;
         const unitPrice = parseFloat(lp.price) || 0;
-        const lineArr = unitPrice * qty;
-        totalArr += lineArr;
+        const annualArr = unitPrice * qty;
+        const productName = String(lp.name || 'Product').trim() || 'Product';
+        const productCode = deriveProductCode(lp);
+        const lineRevType = normalizeLineRevenueType(lp.revenue_type, revenueType || '');
 
-        const segProps = {
-          segment_name: lp.name || 'Product',
-          product_name: lp.name || 'Product',
-          product_code: lp.hs_sku || '',
-          quantity: String(qty),
-          unit_price: String(unitPrice),
-          arr: String(lineArr),
-          mrr: String(lineArr / 12),
-          tcv: String(lineArr),
-          status: determineStatus(startDate, endDate),
-          start_date: startDate,
-          end_date: endDate,
-          segment_year: '1',
-          segment_index: String(created),
-          segment_label: `Year 1`,
-          revenue_type: normalizeLineRevenueType(lp.revenue_type, revenueType || ''),
-        };
-
+        // Resolve amendment_indicator once per line item (constant across years).
+        let perLineIndicator = null;
         if (amendmentIndicator) {
           let indicator = amendmentIndicator;
           if (dealCategory === 'amendment') {
-            const lineRevType = normalizeLineRevenueType(lp.revenue_type, 'renewal');
-            if (lineRevType === 'expansion' || lineRevType === 'cross_sell' || lineRevType === 'new') {
+            const liRev = normalizeLineRevenueType(lp.revenue_type, 'renewal');
+            if (liRev === 'expansion' || liRev === 'cross_sell' || liRev === 'new') {
               indicator = 'Expansion';
-            } else if (lineRevType === 'contraction') {
+            } else if (liRev === 'contraction') {
               indicator = 'Contraction';
             } else {
               indicator = 'Renewal';
             }
           }
-          // Per-line-item amendment indicator: on contraction deals, items tagged
-          // as expansion or cross-sell get "Expansion" instead of "Contraction"
           if (dealCategory === 'contraction') {
-            const lineRevType = (lp.revenue_type || '').toLowerCase();
-            if (lineRevType === 'expansion' || lineRevType === 'cross_sell') {
+            const liRev = (lp.revenue_type || '').toLowerCase();
+            if (liRev === 'expansion' || liRev === 'cross_sell') {
               indicator = 'Expansion';
             }
           }
-          segProps.amendment_indicator = indicator;
+          perLineIndicator = indicator;
         }
 
-        const seg = await createObject(subscriptionTypeId, segProps);
-        try { await createAssociation(subscriptionTypeId, seg.id, contractTypeId, cId); } catch (e) { /* ok */ }
-        if (companyId) {
-          try { await createAssociation(subscriptionTypeId, seg.id, '0-2', companyId); } catch (e) { /* ok */ }
+        for (const [yearIdx, segYear] of yearSegments.entries()) {
+          totalArr += annualArr;
+
+          const segProps = {
+            segment_name: `${cleanContractName} — ${productCode} Year ${segYear.year}`,
+            product_name: productName,
+            product_code: productCode,
+            quantity: String(qty),
+            original_quantity: String(qty),
+            unit_price: String(unitPrice),
+            arr: String(annualArr),
+            mrr: String(annualArr / 12),
+            tcv: String(annualArr),
+            status: determineStatus(segYear.start_date, segYear.end_date),
+            start_date: segYear.start_date,
+            end_date: segYear.end_date,
+            subscription_start_date: startDate,
+            subscription_end_date: endDate,
+            arr_start_date: segYear.start_date,
+            arr_end_date: segYear.end_date,
+            segment_year: String(segYear.year),
+            segment_index: String(yearIdx + 1),
+            segment_label: `Year ${segYear.year}`,
+            segment_key: `${cId}-${liIndex + 1}-${yearIdx + 1}`,
+            billing_frequency: 'annual',
+            charge_type: 'recurring',
+            revenue_type: lineRevType,
+          };
+
+          if (perLineIndicator) segProps.amendment_indicator = perLineIndicator;
+
+          const seg = await createObject(subscriptionTypeId, segProps);
+          try { await createAssociation(subscriptionTypeId, seg.id, contractTypeId, cId); } catch (e) { /* ok */ }
+          if (companyId) {
+            try { await createAssociation(subscriptionTypeId, seg.id, '0-2', companyId); } catch (e) { /* ok */ }
+          }
+          created++;
+          console.log(`[update-contract] Created segment ${seg.id}: ${productName} Year ${segYear.year} x${qty} @ ${unitPrice}`);
         }
-        created++;
-        console.log(`[update-contract] Created segment ${seg.id}: ${lp.name} x${qty} @ ${unitPrice}`);
       }
 
       const skippedOneTime = lineItems.length - recurringItems.length;
@@ -2678,8 +2762,12 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
 
       const lineItems = await getDealLineItems();
 
+      const newBusinessContractName = (dp.dealname || 'Contract')
+        .replace(' — New Business', '')
+        .replace(' - New Business', '');
+
       const contract = await createObject(contractTypeId, {
-        contract_name: dp.dealname.replace(' — New Business', '').replace(' - New Business', ''),
+        contract_name: newBusinessContractName,
         status: determineStatus(startDate, endDate),
         start_date: startDate,
         end_date: endDate,
@@ -2707,6 +2795,7 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
             endDate,
             revenueType: 'new',
             companyId,
+            contractName: newBusinessContractName,
           });
           segmentsCreated = result.created;
 
@@ -2792,6 +2881,7 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
               endDate: renewalEnd,
               revenueType: 'renewal',
               companyId,
+              contractName,
             });
             segmentsCreated = result.created;
 
@@ -2860,6 +2950,7 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
               amendmentIndicator: category === 'expansion' ? 'Expansion' : (category === 'contraction' ? 'Contraction' : 'Renewal'),
               dealCategory: category,
               companyId,
+              contractName: cp.contract_name || 'Contract',
             });
             segmentsCreated = result.created;
             newTotalArr = result.totalArr;
