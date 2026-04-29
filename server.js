@@ -114,6 +114,17 @@ function isSuperAdminEmail(email) {
   return SUPER_ADMIN_EMAILS.includes(String(email).trim().toLowerCase());
 }
 
+// ── Pipeline Routing ─────────────────────────────────────────────────────────
+// Renewals and amendments live in dedicated pipelines, NOT the default sales
+// pipeline. IDs are env-driven so they can be moved between portals/sandboxes
+// without code changes; the hardcoded fallbacks are FinQuery production IDs
+// (renewals: 860641302, amendments: 885603116) so behavior is correct out of
+// the box if the env vars are not set.
+const RENEWAL_PIPELINE_ID = process.env.RENEWAL_PIPELINE_ID || '860641302';
+const RENEWAL_DEAL_STAGE = process.env.RENEWAL_DEAL_STAGE || '1331037727';
+const AMENDMENT_PIPELINE_ID = process.env.AMENDMENT_PIPELINE_ID || '885603116';
+const AMENDMENT_DEAL_STAGE = process.env.AMENDMENT_DEAL_STAGE || '1331048084';
+
 // ── Type ID Cache ────────────────────────────────────────────────────────────
 let contractTypeId = null;
 let subscriptionTypeId = null;
@@ -170,8 +181,8 @@ const CONTRACT_SCHEMA = {
     },
 
     // ── Dates ────────────────────────────────────────────────────────────
-    { name: 'start_date', label: 'Contract Start Date', type: 'date', fieldType: 'date' },
-    { name: 'end_date', label: 'Contract End Date', type: 'date', fieldType: 'date' },
+    { name: 'contract_start_date', label: 'Contract Start Date', type: 'date', fieldType: 'date' },
+    { name: 'contract_end_date', label: 'Contract End Date', type: 'date', fieldType: 'date' },
     { name: 'co_term_date', label: 'Co-Term Date', type: 'date', fieldType: 'date' },
     { name: 'activated_date', label: 'Activated Date', type: 'date', fieldType: 'date' },
     { name: 'terminated_date', label: 'Terminated Date', type: 'date', fieldType: 'date' },
@@ -474,7 +485,7 @@ const DEAL_PROPERTIES = [
 const CONTRACT_PROPS = [
   'contract_name', 'contract_number', 'sf_contract_id', 'description',
   'status', 'termination_reason',
-  'start_date', 'end_date', 'co_term_date', 'activated_date', 'terminated_date',
+  'contract_start_date', 'contract_end_date', 'co_term_date', 'activated_date', 'terminated_date',
   'company_signed_date', 'customer_signed_date', 'customer_signed_title',
   'amendment_start_date', 'contract_renewed_on',
   'contract_term', 'previous_contract_term', 'renewal_term', 'evergreen',
@@ -711,7 +722,7 @@ function parseDateValue(value) {
 }
 
 function getContractEndDate(props = {}) {
-  return props.end_date || props.co_term_date || null;
+  return props.contract_end_date || props.co_term_date || null;
 }
 
 function determineStatus(startDate, endDate) {
@@ -1617,10 +1628,10 @@ app.get('/api/start-amendment', async (req, res) => {
 
     const dealProps = {
       dealname: dealName,
-      dealstage: 'appointmentscheduled',
+      dealstage: AMENDMENT_DEAL_STAGE,
       contract_start_date: startDate || fmtDateForHS(new Date()),
       contract_end_date: getContractEndDate(props),
-      pipeline: 'default',
+      pipeline: AMENDMENT_PIPELINE_ID,
     };
 
     const deal = await createObject('0-3', dealProps);
@@ -1752,7 +1763,7 @@ app.get('/api/reverse-termination', async (req, res) => {
       return res.json({ success: false, message: 'Contract is not terminated' });
     }
 
-    const newStatus = determineStatus(props.start_date, props.end_date);
+    const newStatus = determineStatus(props.contract_start_date, props.contract_end_date);
 
     await updateObject(contractTypeId, contractId, {
       status: newStatus,
@@ -1807,8 +1818,8 @@ async function createRenewalDealForContract(contractId, options = {}) {
     closeDateOverride = null,         // close date should = current contract end date for forecasting
     contractPropsOverride = null,     // optional pre-fetched props to avoid an extra GET
     skipIfOpenRenewalExists = true,
-    pipeline = 'default',
-    dealStage = 'appointmentscheduled',
+    pipeline = RENEWAL_PIPELINE_ID,
+    dealStage = RENEWAL_DEAL_STAGE,
   } = options;
 
   await resolveTypeIds();
@@ -2041,12 +2052,12 @@ app.get('/api/trigger-auto-renewal', async (req, res) => {
 
     const deal = await createObject('0-3', {
       dealname: dealName,
-      dealstage: 'appointmentscheduled',
+      dealstage: RENEWAL_DEAL_STAGE,
       deal_category: 'renewal',
       contract_start_date: fmtDateForHS(renewalStart),
       contract_end_date: fmtDateForHS(renewalEnd),
       amount: props.total_arr || '0',
-      pipeline: 'default',
+      pipeline: RENEWAL_PIPELINE_ID,
     });
 
     const warnings = [];
@@ -2115,7 +2126,7 @@ app.get('/api/check-auto-renewals', async (req, res) => {
           { propertyName: 'status', operator: 'IN', values: ['active', 'future'] },
         ],
       }],
-      properties: ['contract_name', 'auto_renewal_date', 'auto_renewal_released', 'status', 'end_date', 'co_term_date', 'total_arr'],
+      properties: ['contract_name', 'auto_renewal_date', 'auto_renewal_released', 'status', 'contract_end_date', 'co_term_date', 'total_arr'],
       limit: 100,
     });
 
@@ -2136,12 +2147,12 @@ app.get('/api/check-auto-renewals', async (req, res) => {
         const dealName = `${cp.contract_name || 'Contract'} — Auto-Renewal`;
         const deal = await createObject('0-3', {
           dealname: dealName,
-          dealstage: 'appointmentscheduled',
+          dealstage: RENEWAL_DEAL_STAGE,
           deal_category: 'renewal',
           contract_start_date: fmtDateForHS(renewalStart),
           contract_end_date: fmtDateForHS(renewalEnd),
           amount: cp.total_arr || '0',
-          pipeline: 'default',
+          pipeline: RENEWAL_PIPELINE_ID,
         });
 
         try { await createAssociation(contractTypeId, c.id, '0-3', deal.id); } catch (e) { /* ok */ }
@@ -2197,7 +2208,7 @@ app.get('/api/run-status-check', async (req, res) => {
       return res.json({ success: true, message: 'Contract is terminated — no status change', status: 'terminated' });
     }
 
-    const newStatus = determineStatus(props.start_date, props.end_date);
+    const newStatus = determineStatus(props.contract_start_date, props.contract_end_date);
     const updates = {};
 
     if (newStatus !== props.status) {
@@ -2281,8 +2292,8 @@ app.get('/api/load-account-rollups', async (req, res) => {
           name: cp.contract_name,
           status: cp.status,
           arr: parseFloat(cp.total_arr) || 0,
-          startDate: cp.start_date,
-          endDate: cp.end_date,
+          startDate: cp.contract_start_date,
+          endDate: cp.contract_end_date,
         });
         if (cp.status === 'active') {
           activeContracts++;
@@ -2337,7 +2348,7 @@ app.get('/api/load-company-contracts', async (req, res) => {
         const c = await getObject(contractTypeId, cid, CONTRACT_PROPS);
         const cp = c.properties;
         const rawStatus = cp.status;
-        const derivedStatus = determineStatus(cp.start_date, cp.end_date);
+        const derivedStatus = determineStatus(cp.contract_start_date, cp.contract_end_date);
         const status =
           rawStatus === 'terminated' || rawStatus === 'draft' || rawStatus === 'in_approval_process'
             ? rawStatus
@@ -2394,8 +2405,8 @@ app.get('/api/load-company-contracts', async (req, res) => {
           arr,
           mrr,
           tcv,
-          startDate: cp.start_date || null,
-          endDate: cp.end_date || cp.co_term_date || null,
+          startDate: cp.contract_start_date || null,
+          endDate: cp.contract_end_date || cp.co_term_date || null,
           coTermDate: cp.co_term_date,
           term: parseInt(cp.contract_term) || null,
           renewalTerm: parseInt(cp.renewal_term) || null,
@@ -2923,8 +2934,8 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
       const contract = await createObject(contractTypeId, {
         contract_name: newBusinessContractName,
         status: determineStatus(startDate, endDate),
-        start_date: startDate,
-        end_date: endDate,
+        contract_start_date: startDate,
+        contract_end_date: endDate,
         co_term_date: endDate,
         total_arr: dp.amount || '0',
         total_tcv: dp.amount || '0',
@@ -3019,8 +3030,8 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
         const newContract = await createObject(contractTypeId, {
           contract_name: contractName,
           status: determineStatus(renewalStart, renewalEnd),
-          start_date: renewalStart,
-          end_date: renewalEnd,
+          contract_start_date: renewalStart,
+          contract_end_date: renewalEnd,
           co_term_date: renewalEnd,
           total_arr: dp.amount || cp.total_arr || '0',
           total_tcv: dp.amount || cp.total_tcv || '0',
@@ -3163,7 +3174,7 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
           newTotalArr = metrics.total_arr;
         }
 
-        updates.status = determineStatus(cp.start_date, cp.end_date);
+        updates.status = determineStatus(cp.contract_start_date, cp.contract_end_date);
 
         // Auto-terminate if amendment results in zero ARR
         if (newTotalArr <= 0 && (category === 'contraction' || category === 'amendment')) {
@@ -3202,7 +3213,7 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
       }
 
       // ── FALLBACK for other categories ────────────────────────────────
-      const newStatus = determineStatus(cp.start_date, cp.end_date);
+      const newStatus = determineStatus(cp.contract_start_date, cp.contract_end_date);
       updates.status = newStatus;
 
       if (Object.keys(updates).length > 0) {
@@ -3238,7 +3249,7 @@ app.get('/api/seed-subscriptions', async (req, res) => {
 
     const { data: searchResult } = await hs.post(`/crm/v3/objects/${contractTypeId}/search`, {
       filterGroups: [],
-      properties: ['contract_name', 'contract_number', 'status', 'start_date', 'end_date', 'total_arr'],
+      properties: ['contract_name', 'contract_number', 'status', 'contract_start_date', 'contract_end_date', 'total_arr'],
       limit: 20,
     });
 
@@ -3259,7 +3270,7 @@ app.get('/api/seed-subscriptions', async (req, res) => {
         continue;
       }
 
-      const startDate = cp.start_date || '2025-01-01';
+      const startDate = cp.contract_start_date || '2025-01-01';
       const startYear = new Date(startDate).getFullYear();
       const startMonth = new Date(startDate).getMonth();
       const startDay = new Date(startDate).getDate();
@@ -3303,7 +3314,7 @@ app.get('/api/seed-subscriptions', async (req, res) => {
           arr_start_date: segDate(0),
           arr_end_date: segEndDate(1),
           subscription_start_date: segDate(0),
-          subscription_end_date: cp.end_date || segEndDate(3),
+          subscription_end_date: cp.contract_end_date || segEndDate(3),
           quantity: '200',
           unit_price: '500',
           list_price: '600',
@@ -3338,7 +3349,7 @@ app.get('/api/seed-subscriptions', async (req, res) => {
           arr_start_date: segDate(1),
           arr_end_date: segEndDate(2),
           subscription_start_date: segDate(0),
-          subscription_end_date: cp.end_date || segEndDate(3),
+          subscription_end_date: cp.contract_end_date || segEndDate(3),
           quantity: '200',
           unit_price: '515',
           list_price: '600',
@@ -3373,7 +3384,7 @@ app.get('/api/seed-subscriptions', async (req, res) => {
           arr_start_date: segDate(2),
           arr_end_date: segEndDate(3),
           subscription_start_date: segDate(0),
-          subscription_end_date: cp.end_date || segEndDate(3),
+          subscription_end_date: cp.contract_end_date || segEndDate(3),
           quantity: '200',
           unit_price: '530.45',
           list_price: '600',
@@ -3408,7 +3419,7 @@ app.get('/api/seed-subscriptions', async (req, res) => {
           arr_start_date: segDate(0, startMonth + 6 > 11 ? startMonth + 6 - 12 : startMonth + 6, 1),
           arr_end_date: segEndDate(2),
           subscription_start_date: segDate(0, startMonth + 6 > 11 ? startMonth + 6 - 12 : startMonth + 6, 1),
-          subscription_end_date: cp.end_date || segEndDate(3),
+          subscription_end_date: cp.contract_end_date || segEndDate(3),
           quantity: '1',
           unit_price: '55000',
           list_price: '65000',
@@ -3444,7 +3455,7 @@ app.get('/api/seed-subscriptions', async (req, res) => {
           arr_start_date: segDate(2),
           arr_end_date: segEndDate(3),
           subscription_start_date: segDate(0, startMonth + 6 > 11 ? startMonth + 6 - 12 : startMonth + 6, 1),
-          subscription_end_date: cp.end_date || segEndDate(3),
+          subscription_end_date: cp.contract_end_date || segEndDate(3),
           quantity: '1',
           unit_price: '56650',
           list_price: '65000',
@@ -3529,7 +3540,7 @@ app.get('/api/sweep-contract-statuses', async (req, res) => {
       const pageSize = Math.min(100, limit - scanned);
       const body = {
         filterGroups: [],
-        properties: ['contract_name', 'status', 'start_date', 'end_date', 'co_term_date'],
+        properties: ['contract_name', 'status', 'contract_start_date', 'contract_end_date', 'co_term_date'],
         limit: pageSize,
       };
       if (after) body.after = after;
@@ -3553,7 +3564,7 @@ app.get('/api/sweep-contract-statuses', async (req, res) => {
           continue;
         }
 
-        const newStatus = determineStatus(cp.start_date, getContractEndDate(cp));
+        const newStatus = determineStatus(cp.contract_start_date, getContractEndDate(cp));
         if (!newStatus || newStatus === currentStatus) {
           unchanged++;
           continue;
@@ -3587,8 +3598,8 @@ app.get('/api/sweep-contract-statuses', async (req, res) => {
           name: cp.contract_name,
           from: currentStatus,
           to: newStatus,
-          startDate: cp.start_date,
-          endDate: cp.end_date,
+          startDate: cp.contract_start_date,
+          endDate: cp.contract_end_date,
         });
       }
 
@@ -3647,7 +3658,7 @@ app.get('/api/load-test-data', async (req, res) => {
       });
     }
 
-    const startDate = cp.start_date || fmtDateForHS(new Date());
+    const startDate = cp.contract_start_date || fmtDateForHS(new Date());
     const endDate = getContractEndDate(cp)
       || fmtDateForHS((() => { const d = parseDateValue(startDate) || new Date(); d.setFullYear(d.getFullYear() + 3); return d; })());
 
@@ -3835,8 +3846,8 @@ app.get('/api/load-netsuite-test-data', async (req, res) => {
 // HubSpot Custom Report or a Snowflake-style export.
 //
 // Cohort buckets:
-//   - startedThisQuarter: contracts whose start_date falls in the current quarter
-//   - endingThisQuarter: contracts whose end_date falls in the current quarter
+//   - startedThisQuarter: contracts whose contract_start_date falls in the current quarter
+//   - endingThisQuarter: contracts whose contract_end_date falls in the current quarter
 //   - byArrBand: contracts grouped by Year 1 ARR band (<10K, 10–50K, 50–100K, 100K–250K, 250K+)
 //   - yearByYear: contracts joined to their subscription segments, summarised by segment_year
 //
@@ -3902,7 +3913,7 @@ app.get('/api/reports/contract-cohorts', async (req, res) => {
         filterGroups: [],
         properties: [
           'contract_name', 'contract_number', 'status',
-          'start_date', 'end_date', 'co_term_date',
+          'contract_start_date', 'contract_end_date', 'co_term_date',
           'total_arr', 'total_tcv', 'lq_arr', 'fcm_arr',
           'subscription_count',
         ],
@@ -3925,7 +3936,7 @@ app.get('/api/reports/contract-cohorts', async (req, res) => {
           name: cp.contract_name,
           number: cp.contract_number,
           status: cp.status,
-          startDate: cp.start_date,
+          startDate: cp.contract_start_date,
           endDate,
           totalArr,
           totalTcv: parseFloat(cp.total_tcv) || 0,
@@ -3933,7 +3944,7 @@ app.get('/api/reports/contract-cohorts', async (req, res) => {
           fcmArr: parseFloat(cp.fcm_arr) || 0,
         };
 
-        if (inWindow(cp.start_date, currentQuarterStart, currentQuarterEnd)) {
+        if (inWindow(cp.contract_start_date, currentQuarterStart, currentQuarterEnd)) {
           startedThisQuarter.push(summary);
         }
         if (inWindow(endDate, currentQuarterStart, currentQuarterEnd)) {

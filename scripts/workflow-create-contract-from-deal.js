@@ -60,6 +60,34 @@ const LINE_ITEM_PROPS = [
   'revenue_type',
 ];
 
+// Minimum contract properties this workflow needs to write. We self-heal any
+// missing ones on the contract schema before creating the record so the
+// workflow never fails with PROPERTY_DOESNT_EXIST in portals where the schema
+// was created with an older / leaner definition.
+const CONTRACT_REQUIRED_PROPERTIES = [
+  { name: 'contract_name', label: 'Contract Name', type: 'string', fieldType: 'text', hasUniqueValue: false },
+  {
+    name: 'status', label: 'Status', type: 'enumeration', fieldType: 'select',
+    options: [
+      { label: 'Draft', value: 'draft' },
+      { label: 'In Approval Process', value: 'in_approval_process' },
+      { label: 'Active', value: 'active' },
+      { label: 'Future', value: 'future' },
+      { label: 'Inactive', value: 'inactive' },
+      { label: 'Expired', value: 'expired' },
+      { label: 'Terminated', value: 'terminated' },
+    ],
+  },
+  { name: 'contract_start_date', label: 'Contract Start Date', type: 'date', fieldType: 'date' },
+  { name: 'contract_end_date', label: 'Contract End Date', type: 'date', fieldType: 'date' },
+  { name: 'co_term_date', label: 'Co-Term Date', type: 'date', fieldType: 'date' },
+  { name: 'total_arr', label: 'Total ARR', type: 'number', fieldType: 'number' },
+  { name: 'total_tcv', label: 'Total TCV', type: 'number', fieldType: 'number' },
+  { name: 'subscription_count', label: 'Subscription Count', type: 'number', fieldType: 'number' },
+  { name: 'amendment_count', label: 'Amendment Count', type: 'number', fieldType: 'number' },
+  { name: 'contract_data', label: 'Contract Data', type: 'string', fieldType: 'textarea' },
+];
+
 function fmtDateForHS(value) {
   const d = value instanceof Date ? value : new Date(value);
   if (Number.isNaN(d.getTime())) return null;
@@ -279,6 +307,29 @@ function filterPropertiesForSchema(properties, schemaPropertyNames) {
   return filtered;
 }
 
+async function ensureSchemaProperties(hs, typeId, expectedProperties, existingPropertyNames) {
+  const created = [];
+  for (const prop of expectedProperties) {
+    if (existingPropertyNames.has(prop.name)) continue;
+    try {
+      await hs.post(`/crm/v3/properties/${typeId}`, prop);
+      existingPropertyNames.add(prop.name);
+      created.push(prop.name);
+      console.log(`[ensure-properties] Created missing property ${prop.name} on ${typeId}`);
+    } catch (err) {
+      const status = err?.response?.status;
+      if (status === 409) {
+        existingPropertyNames.add(prop.name);
+        continue;
+      }
+      console.warn(
+        `[ensure-properties] Failed to create ${prop.name} on ${typeId}: ${parseHubSpotErrorMessage(err)}`
+      );
+    }
+  }
+  return created;
+}
+
 exports.main = async (event, callback) => {
   try {
     const dealId = String(
@@ -371,7 +422,20 @@ exports.main = async (event, callback) => {
     if (!contractTypeId) throw new Error('Could not find schema fq_contract.');
     if (!subscriptionTypeId) throw new Error('Could not find schema fq_subscription.');
 
-    const subscriptionSchemaPropertyNames = await getSchemaPropertyNamesByTypeId(hs, subscriptionTypeId);
+    const [contractSchemaPropertyNames, subscriptionSchemaPropertyNames] = await Promise.all([
+      getSchemaPropertyNamesByTypeId(hs, contractTypeId),
+      getSchemaPropertyNamesByTypeId(hs, subscriptionTypeId),
+    ]);
+
+    // Self-heal any contract properties this workflow needs but the live
+    // schema is missing (e.g. older portals where start_date / end_date were
+    // never created on fq_contract).
+    await ensureSchemaProperties(
+      hs,
+      contractTypeId,
+      CONTRACT_REQUIRED_PROPERTIES,
+      contractSchemaPropertyNames
+    );
 
     const deal = await getObject(hs, '0-3', dealId, DEAL_PROPS);
     const dealProps = deal.properties || {};
@@ -397,11 +461,11 @@ exports.main = async (event, callback) => {
 
     const category = String(dealProps.deal_category || 'new_business').toLowerCase();
 
-    const contractPayload = {
+    const contractPayloadRaw = {
       contract_name: cleanContractName(dealProps.dealname),
       status: determineStatus(derivedStartDate, derivedEndDate),
-      start_date: derivedStartDate,
-      end_date: derivedEndDate,
+      contract_start_date: derivedStartDate,
+      contract_end_date: derivedEndDate,
       co_term_date: derivedEndDate,
       total_arr: '0',
       total_tcv: '0',
@@ -416,7 +480,16 @@ exports.main = async (event, callback) => {
       }),
     };
 
-    const contract = await createObject(hs, contractTypeId, contractPayload);
+    const contractPayload = filterPropertiesForSchema(contractPayloadRaw, contractSchemaPropertyNames);
+    const contractRequiredKeys = ['contract_name', 'status', 'contract_data'].filter((key) =>
+      contractSchemaPropertyNames.has(key)
+    );
+    const contract = await createObjectWithFallback(
+      hs,
+      contractTypeId,
+      contractPayload,
+      contractRequiredKeys
+    );
 
     await associateWithFallback(hs, contractTypeId, contract.id, '0-3', dealId);
 
@@ -527,13 +600,23 @@ exports.main = async (event, callback) => {
       }
     }
 
-    await hs.patch(`/crm/v3/objects/${contractTypeId}/${contract.id}`, {
-      properties: {
+    const rollupPayload = filterPropertiesForSchema(
+      {
         total_arr: String(totalArr),
         total_tcv: String(totalArr),
         subscription_count: String(createdSegments),
       },
-    });
+      contractSchemaPropertyNames
+    );
+    if (Object.keys(rollupPayload).length) {
+      try {
+        await hs.patch(`/crm/v3/objects/${contractTypeId}/${contract.id}`, {
+          properties: rollupPayload,
+        });
+      } catch (rollupErr) {
+        console.warn(`Contract rollup patch failed: ${parseHubSpotErrorMessage(rollupErr)}`);
+      }
+    }
 
     // ── Auto-spawn next-cycle renewal deal ───────────────────────────────────
     // Per Apr 28 training: renewal deals must be generated IMMEDIATELY on
