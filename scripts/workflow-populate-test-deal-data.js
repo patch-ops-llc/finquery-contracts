@@ -39,12 +39,20 @@
  *        - dealAmount (number)        : Override total deal amount.
  *        - productMix (string)        : "lq" | "fcm" | "both" (default:
  *                                       persona-driven)
- *        - termMonths (number)        : Contract term in months (default:
- *                                       persona-driven)
+ *        - termMonths (number)        : Contract term in months (default: 36
+ *                                       so multi-year segment logic gets
+ *                                       exercised by default).
  *        - includeOneTime (string)    : "true"/"false" -- add an implementation
  *                                       fee one-time line item (default: true)
  *        - companyName (string)       : Override company name (default: random)
  *        - numContacts (number)       : 1, 2, or 3 (default: random by seed)
+ *
+ *   Recurring products are emitted as one line item PER 12-month segment year
+ *   (so a 36-month term produces 3 LQ + 3 FCM line items, each tagged with
+ *   its own hs_recurring_billing_start_date / hs_recurring_billing_end_date).
+ *   This mirrors the MDQ pattern the contract object expects -- one line item
+ *   per product per segment year -- and lets the contract card render
+ *   multi-year subscription segments correctly.
  *   6) Output fields:
  *        - success (string)
  *        - companyId (string)
@@ -348,6 +356,48 @@ async function createObject(hs, typeId, properties, associations) {
   return data;
 }
 
+// Line-item creation can fail with HTTP 400 when the portal hasn't
+// provisioned a property we tried to set (most commonly the custom
+// `start_date` / `end_date` fields, or `revenue_type` on a fresh test
+// portal). Strip the offending property from the payload and retry rather
+// than failing the entire workflow run. Each retry walks the message,
+// removes any property whose name appears in the error, and tries again
+// until either the create succeeds or no more properties can be stripped.
+const OPTIONAL_LINE_ITEM_PROPS = [
+  'start_date',
+  'end_date',
+  'hs_recurring_billing_start_date',
+  'hs_recurring_billing_end_date',
+  'hs_recurring_billing_period',
+  'hs_recurring_billing_number_of_payments',
+  'recurringbillingfrequency',
+  'revenue_type',
+];
+
+async function createLineItem(hs, properties) {
+  let attemptProps = { ...properties };
+  let lastError;
+  for (let attempt = 0; attempt < OPTIONAL_LINE_ITEM_PROPS.length + 1; attempt++) {
+    try {
+      return await createObject(hs, TYPE.LINE_ITEM, attemptProps);
+    } catch (err) {
+      lastError = err;
+      if (err?.response?.status !== 400) throw err;
+      const message = JSON.stringify(err?.response?.data || err?.message || '').toLowerCase();
+      const offender = OPTIONAL_LINE_ITEM_PROPS.find(
+        (key) => message.includes(key) && Object.prototype.hasOwnProperty.call(attemptProps, key),
+      );
+      if (!offender) throw err;
+      console.warn(
+        `[populate-test-deal-data] Stripping unsupported line item property "${offender}" and retrying.`,
+      );
+      const { [offender]: _omit, ...rest } = attemptProps;
+      attemptProps = rest;
+    }
+  }
+  throw lastError;
+}
+
 async function getAssociatedIds(hs, fromType, fromId, toType) {
   try {
     const { data } = await hs.get(`/crm/v4/objects/${fromType}/${fromId}/associations/${toType}`);
@@ -402,24 +452,95 @@ function buildContactProperties(rng, companyName, companyDomain, areaCode, isPri
   };
 }
 
-function buildLineItemProperties(product, contractStart, termMonths) {
+// Builds a single line item. Recurring products are split into one line per
+// 12-month segment so multi-year contracts produce the MDQ pattern (one line
+// item per product per segment year). Each line item -- recurring AND
+// one-time -- gets its own start/end dates written to BOTH the HubSpot
+// system fields (`hs_recurring_billing_start_date` /
+// `hs_recurring_billing_end_date`) AND the simple `start_date` / `end_date`
+// custom properties, so whichever set the portal exposes is populated.
+//
+// CRITICAL: do NOT set `hs_recurring_billing_period` and
+// `hs_recurring_billing_number_of_payments` together. When both are present
+// HubSpot recomputes `hs_recurring_billing_end_date` as
+// `start + period × number_of_payments`, which leaves the persisted end date
+// 1 day past the intended term boundary (e.g. 2027-05-16 instead of
+// 2027-05-15 for a 1-year line that started 2026-05-16). Downstream the
+// contract object's `buildYearSegments` then emits a bogus single-day
+// "Year 2" segment per line item — the exact bug the contract card was
+// surfacing on Apr 30 test contracts.
+function buildLineItemProperties(product, lineStart, lineEnd, segmentYear, totalSegments) {
   const amount = product.unitPrice * product.quantity;
+  const isMultiSegment = product.recurring && totalSegments > 1;
+  const yearSuffix = isMultiSegment ? ` (Year ${segmentYear} of ${totalSegments})` : '';
+  const startStr = fmtDate(lineStart);
+  const endStr = fmtDate(lineEnd);
   const props = {
-    name: product.name,
+    name: `${product.name}${yearSuffix}`,
     hs_sku: product.sku,
-    description: `Auto-generated test ${product.name}`,
+    description: `Auto-generated test ${product.name}${yearSuffix}`,
     quantity: String(product.quantity),
     price: String(product.unitPrice),
     amount: String(amount),
     hs_line_item_currency_code: 'USD',
-    revenue_type: product.recurring ? 'new' : 'new',
+    revenue_type: 'new',
+
+    // HubSpot system date fields (used by the contract object's segment
+    // derivation logic via resolveLineItemSpan).
+    hs_recurring_billing_start_date: startStr,
+    hs_recurring_billing_end_date: endStr,
+
+    // Simple custom date fields — populated alongside the system fields so
+    // either set works for downstream consumers.
+    start_date: startStr,
+    end_date: endStr,
   };
   if (product.recurring) {
-    props.hs_recurring_billing_period = `P${termMonths}M`;
-    props.hs_recurring_billing_start_date = fmtDate(contractStart);
-    props.hs_recurring_billing_number_of_payments = '1';
+    // Period only — number_of_payments intentionally omitted (see header).
+    props.hs_recurring_billing_period = 'P12M';
+  } else {
+    // Mark one-time charges (Implementation, Onboarding, Setup, etc.)
+    // unambiguously. The contract creation logic uses `recurringbillingfrequency`
+    // and the line item name to filter recurring vs one-time, but the explicit
+    // marker means we don't depend on name-pattern matching.
+    props.recurringbillingfrequency = 'one_time';
   }
   return props;
+}
+
+// Produces a list of line-item descriptors for the deal. Recurring products
+// are exploded into per-year segments; one-time products produce a single
+// entry dated to the contract start.
+function buildLineItemPlan(products, contractStart, contractEnd, termMonths) {
+  const totalSegments = Math.max(1, Math.ceil(termMonths / 12));
+  const plan = [];
+  for (const product of products) {
+    if (!product.recurring) {
+      plan.push({
+        product,
+        lineStart: contractStart,
+        lineEnd: contractStart,
+        segmentYear: 1,
+        totalSegments: 1,
+      });
+      continue;
+    }
+    let segmentStart = new Date(contractStart);
+    for (let year = 1; year <= totalSegments; year++) {
+      const naiveSegmentEnd = addDays(addMonths(segmentStart, 12), -1);
+      const segmentEnd = naiveSegmentEnd > contractEnd ? new Date(contractEnd) : naiveSegmentEnd;
+      plan.push({
+        product,
+        lineStart: new Date(segmentStart),
+        lineEnd: new Date(segmentEnd),
+        segmentYear: year,
+        totalSegments,
+      });
+      segmentStart = addDays(segmentEnd, 1);
+      if (segmentStart > contractEnd) break;
+    }
+  }
+  return plan;
 }
 
 function chooseProductMix(productMix, persona) {
@@ -490,9 +611,10 @@ exports.main = async (event, callback) => {
     const includeOneTime = parseBool(inputs.includeOneTime, true);
     const numContacts = Math.min(3, Math.max(1,
       Number(inputs.numContacts) || randomInt(rng, 1, 3)));
-    const termMonths = Math.max(1,
-      Number(inputs.termMonths)
-        || randomInt(rng, persona.contractMonths[0], persona.contractMonths[1]));
+    // Default to 36 months (3 years) so the multi-year segment logic gets
+    // exercised on every fresh test deal. Personas can still bias shorter
+    // terms via the `termMonths` input override.
+    const termMonths = Math.max(1, Number(inputs.termMonths) || 36);
     const overrideAmount = Number(inputs.dealAmount);
 
     const today = new Date();
@@ -502,9 +624,14 @@ exports.main = async (event, callback) => {
     const products = [...productMix];
     if (includeOneTime) products.push(PRODUCTS.IMPLEMENTATION);
 
+    const lineItemPlan = buildLineItemPlan(products, contractStart, contractEnd, termMonths);
+
     const discountPct = randomFloat(rng, persona.discountPct[0], persona.discountPct[1]);
-    const computedAmount = products.reduce(
-      (sum, p) => sum + (p.unitPrice * p.quantity * (1 - discountPct / 100)), 0,
+    // Recurring products charge per segment year, so the deal amount needs
+    // to reflect the full multi-year TCV (one charge per line in the plan).
+    const computedAmount = lineItemPlan.reduce(
+      (sum, entry) => sum + (entry.product.unitPrice * entry.product.quantity * (1 - discountPct / 100)),
+      0,
     );
     const dealAmount = Number.isFinite(overrideAmount) && overrideAmount > 0
       ? overrideAmount
@@ -549,10 +676,20 @@ exports.main = async (event, callback) => {
     }
 
     // ── Line items ───────────────────────────────────────────────────────
+    // One line item per recurring product per 12-month segment year, plus a
+    // single one-time line for the implementation fee. Each line carries its
+    // own start/end dates so the contract object can derive segment spans
+    // directly from the line item rather than the deal-level dates.
     const lineItemIds = [];
-    for (const product of products) {
-      const lineProps = buildLineItemProperties(product, contractStart, termMonths);
-      const created = await createObject(hs, TYPE.LINE_ITEM, lineProps);
+    for (const entry of lineItemPlan) {
+      const lineProps = buildLineItemProperties(
+        entry.product,
+        entry.lineStart,
+        entry.lineEnd,
+        entry.segmentYear,
+        entry.totalSegments,
+      );
+      const created = await createLineItem(hs, lineProps);
       const lineItemId = created.id;
       lineItemIds.push(lineItemId);
       await associateDefault(hs, TYPE.DEAL, dealId, TYPE.LINE_ITEM, lineItemId);

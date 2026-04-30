@@ -848,6 +848,15 @@ function resolveLineItemSpan(lineItem, fallbackStart, fallbackEnd) {
 // Splits a [start, end] contract span into 12-month segment buckets:
 // Year 1 = [start, start+1y-1d], Year 2 = [start+1y, start+2y-1d], ... with the
 // last segment truncated to `end`. Returns [{ year, start_date, end_date }].
+//
+// Tolerance for off-by-one line item end dates: HubSpot recomputes
+// hs_recurring_billing_end_date as start + period × number_of_payments when both
+// are set, which can leave the persisted end date 1 day past the intended term
+// boundary (e.g. 2027-05-16 instead of 2027-05-15 for a 1-year line that
+// started 2026-05-16). Without tolerance, this would produce a bogus
+// single-day "Year 2" segment on 5/16. Anything shorter than MIN_TAIL_DAYS at
+// the tail of the loop is folded into the previous segment instead.
+const MIN_TAIL_DAYS = 14;
 function buildYearSegments(startDateStr, endDateStr) {
   const start = parseDateValue(startDateStr);
   const end = parseDateValue(endDateStr);
@@ -864,6 +873,14 @@ function buildYearSegments(startDateStr, endDateStr) {
     nextYearStart.setFullYear(nextYearStart.getFullYear() + 1);
     const candidateEnd = addDaysToDate(nextYearStart, -1);
     const currentEnd = candidateEnd > end ? new Date(end) : candidateEnd;
+
+    const daysInSegment = Math.round((currentEnd - currentStart) / 86400000) + 1;
+    if (segments.length > 0 && daysInSegment > 0 && daysInSegment < MIN_TAIL_DAYS) {
+      // Trailing scrap from an off-by-one line-item end date — extend the
+      // previous segment instead of emitting a 1-day "Year N" segment.
+      segments[segments.length - 1].end_date = fmtDateForHS(currentEnd);
+      break;
+    }
 
     segments.push({
       year: segmentYear,

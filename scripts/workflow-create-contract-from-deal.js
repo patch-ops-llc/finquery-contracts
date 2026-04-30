@@ -28,11 +28,13 @@
  *    - segmentsCreated (number)
  *    - recurringLineItems (number)
  *    - oneTimeLineItems (number)
- *    - totalArr (number)
+ *    - totalArr (number)                  — annualized ARR (one year of recurring revenue)
+ *    - totalTcv (number)                  — total contract value (annual ARR × term years)
  *    - status (string)
  *    - renewalDealId (string)             — populated for new_business / renewal closes
  *    - renewalDealClosedate (string)      — YYYY-MM-DD; matches the new contract's end date
  *    - renewalLineItemsSeeded (number)    — # of line items copied onto the renewal deal
+ *    - renewalDealAmount (number)         — amount on the auto-spawned renewal deal (annual ARR)
  *    - contractLineItemsCopied (number)   — # of source deal line items mirrored onto the contract
  *    - errorMessage (string)
  */
@@ -272,6 +274,14 @@ function resolveLineItemSpan(lineItem, fallbackStart, fallbackEnd) {
   };
 }
 
+// Tolerance for off-by-one line item end dates: HubSpot recomputes
+// hs_recurring_billing_end_date as start + period × number_of_payments when both
+// are set, which can leave the persisted end date 1 day past the intended term
+// boundary. Without tolerance, a 5/16/2026 → 5/16/2027 line item produces a
+// proper Year 1 segment AND a single-day "Year 2" segment on 5/16/2027.
+// Anything shorter than MIN_TAIL_DAYS at the tail of the loop is folded into
+// the previous segment instead of emitting a bogus mini-year.
+const MIN_TAIL_DAYS = 14;
 function buildYearSegments(startDateStr, endDateStr) {
   const start = parseDateValue(startDateStr);
   const end = parseDateValue(endDateStr);
@@ -288,6 +298,12 @@ function buildYearSegments(startDateStr, endDateStr) {
     nextYearStart.setUTCFullYear(nextYearStart.getUTCFullYear() + 1);
     const currentEndCandidate = addDays(nextYearStart, -1);
     const currentEnd = currentEndCandidate > end ? new Date(end) : currentEndCandidate;
+
+    const daysInSegment = Math.round((currentEnd - currentStart) / 86400000) + 1;
+    if (segments.length > 0 && daysInSegment > 0 && daysInSegment < MIN_TAIL_DAYS) {
+      segments[segments.length - 1].end_date = fmtDateForHS(currentEnd);
+      break;
+    }
 
     segments.push({
       year: segmentYear,
@@ -896,7 +912,12 @@ exports.main = async (event, callback) => {
       ])
     );
 
+    // totalArr  = annualized ARR (one year of recurring revenue, summed across recurring line items)
+    // totalTcv  = total contract value (annual ARR × number of yearly segments per line item).
+    // The renewal deal's amount must be annual ARR (one year), NOT TCV — otherwise a
+    // 3-year contract spawns a 1-year renewal deal showing 3× the real renewal ACV.
     let totalArr = 0;
+    let totalTcv = 0;
     const segmentErrors = [];
 
     // One subscription segment per recurring line item per contract year. One-time
@@ -928,8 +949,11 @@ exports.main = async (event, callback) => {
       const lineSpan = resolveLineItemSpan(lineItem, derivedStartDate, derivedEndDate);
       const lineYearSegments = buildYearSegments(lineSpan.startDate, lineSpan.endDate);
 
+      // Annual ARR is added ONCE per line item; TCV accumulates per yearly segment.
+      totalArr += annualArr;
+      totalTcv += annualArr * Math.max(lineYearSegments.length, 1);
+
       for (const [yearIdx, segmentYear] of lineYearSegments.entries()) {
-        totalArr += annualArr;
 
         const segmentPayloadRaw = {
           segment_name: `${cleanedContractName} — ${productCode} Year ${segmentYear.year}`,
@@ -1151,7 +1175,7 @@ exports.main = async (event, callback) => {
     const rollupPayload = filterPropertiesForSchema(
       {
         total_arr: String(totalArr),
-        total_tcv: String(totalArr),
+        total_tcv: String(totalTcv),
         subscription_count: String(createdSegments),
       },
       contractSchemaPropertyNames
@@ -1175,6 +1199,7 @@ exports.main = async (event, callback) => {
     let renewalDealId = '';
     let renewalDealClosedate = '';
     let renewalLineItemsSeeded = 0;
+    let renewalDealAmount = 0;
     const renewalEligibleCategories = ['new_business', 'renewal'];
     if (renewalEligibleCategories.includes(category)) {
       try {
@@ -1188,6 +1213,61 @@ exports.main = async (event, callback) => {
         nextEnd.setUTCFullYear(nextEnd.getUTCFullYear() + 1);
         renewalDealClosedate = derivedEndDate;
 
+        // ── Build the renewal line item set FIRST so we can use its summed
+        // amount as the renewal deal's `amount`. This guarantees the deal
+        // amount matches the seeded line items (one year of recurring
+        // revenue) instead of the source contract's TCV — the previous
+        // behavior made a 3-year contract spawn a renewal deal showing 3×
+        // the real next-year ACV.
+        //
+        // Dedup recurring source line items by product (sku preferred, fall
+        // back to name) so a single product split across multiple source
+        // line items collapses to a single renewal line with summed
+        // quantity + amount. One-time / setup / training charges are
+        // filtered out via `isRecurringLineItem`.
+        const recurringForRenewal = lineItems.filter(isRecurringLineItem);
+        const grouped = new Map();
+        for (const li of recurringForRenewal) {
+          const lp = li.properties || {};
+          const sku = String(lp.hs_sku || '').trim();
+          const name = String(lp.name || 'Product').trim() || 'Product';
+          const key = (sku || name).toLowerCase();
+          const qty = Math.max(0, Number(lp.quantity) || 0) || 1;
+          const unitPrice = Math.max(0, Number(lp.price) || 0);
+          const lineAmount = qty * unitPrice;
+          const period = dealLineItemRenewalPeriod(li) || 'P12M';
+
+          if (!grouped.has(key)) {
+            grouped.set(key, {
+              name,
+              sku,
+              quantity: 0,
+              amount: 0,
+              period,
+              hasExpansion: false,
+            });
+          }
+          const g = grouped.get(key);
+          g.quantity += qty;
+          g.amount += lineAmount;
+          if (!g.sku && sku) g.sku = sku;
+          if (period) g.period = period;
+
+          const lineRevenue = String(lp.revenue_type || '').toLowerCase().trim();
+          if (lineRevenue === 'expansion' || lineRevenue === 'cross_sell' || lineRevenue === 'new') {
+            g.hasExpansion = true;
+          }
+        }
+
+        // Sum the grouped line item amounts to derive the renewal deal's
+        // amount. Falls back to totalArr (annual ARR) when the source deal
+        // has no recurring lines so the deal still has a sensible amount.
+        let renewalGroupedAmount = 0;
+        for (const item of grouped.values()) {
+          renewalGroupedAmount += Number(item.amount) || 0;
+        }
+        renewalDealAmount = renewalGroupedAmount > 0 ? renewalGroupedAmount : (totalArr || 0);
+
         const renewalDealName = `${cleanedContractName} — Renewal`;
         const renewalDeal = await createObject(hs, '0-3', {
           dealname: renewalDealName,
@@ -1196,7 +1276,7 @@ exports.main = async (event, callback) => {
           contract_start_date: fmtDateForHS(nextStart),
           contract_end_date: fmtDateForHS(nextEnd),
           closedate: derivedEndDate,
-          amount: String(totalArr || 0),
+          amount: String(renewalDealAmount),
           pipeline: 'default',
         });
         renewalDealId = String(renewalDeal.id);
@@ -1225,60 +1305,17 @@ exports.main = async (event, callback) => {
             : Promise.resolve(),
         ]);
 
-        // Seed the renewal deal with ONE line item per recurring product from
-        // the source deal. The source deal's line items already represent
-        // this term's quantities/prices for each product, so they map 1:1 to
-        // what the renewal should carry into DealHub. We do NOT pull from
-        // the new contract's subscription segments here -- segments span
-        // every year of the term, and naively inheriting them would result
-        // in N copies of each product (one per year) on the renewal deal.
-        //
-        // Recurring filter mirrors the contract-side `isRecurringLineItem`
-        // logic so one-time / setup / training charges never leak onto the
-        // next-cycle renewal.
+        // Seed the renewal deal with ONE line item per recurring product
+        // (already grouped above). We do NOT pull from the new contract's
+        // subscription segments here -- segments span every year of the
+        // term, and naively inheriting them would result in N copies of
+        // each product (one per year) on the renewal deal.
         try {
-          const recurringForRenewal = lineItems.filter(isRecurringLineItem);
           if (!recurringForRenewal.length) {
             console.log(
               `Renewal deal ${renewalDeal.id}: no recurring line items on source deal — leaving renewal deal empty.`
             );
           } else {
-            // Dedup by product (sku preferred, fall back to name) so a single
-            // product split across multiple source line items still becomes a
-            // single line on the renewal deal with summed quantity + amount.
-            const grouped = new Map();
-            for (const li of recurringForRenewal) {
-              const lp = li.properties || {};
-              const sku = String(lp.hs_sku || '').trim();
-              const name = String(lp.name || 'Product').trim() || 'Product';
-              const key = (sku || name).toLowerCase();
-              const qty = Math.max(0, Number(lp.quantity) || 0) || 1;
-              const unitPrice = Math.max(0, Number(lp.price) || 0);
-              const lineAmount = qty * unitPrice;
-              const period = dealLineItemRenewalPeriod(li) || 'P12M';
-
-              if (!grouped.has(key)) {
-                grouped.set(key, {
-                  name,
-                  sku,
-                  quantity: 0,
-                  amount: 0,
-                  period,
-                  hasExpansion: false,
-                });
-              }
-              const g = grouped.get(key);
-              g.quantity += qty;
-              g.amount += lineAmount;
-              if (!g.sku && sku) g.sku = sku;
-              if (period) g.period = period;
-
-              const lineRevenue = String(lp.revenue_type || '').toLowerCase().trim();
-              if (lineRevenue === 'expansion' || lineRevenue === 'cross_sell' || lineRevenue === 'new') {
-                g.hasExpansion = true;
-              }
-            }
-
             // Stamp every seeded renewal line item with the new term's start
             // / end dates. Keeps the renewal deal's recurring lines in lock
             // step with the deal-level contract_start_date / contract_end_date
@@ -1319,7 +1356,8 @@ exports.main = async (event, callback) => {
               console.log(
                 `Renewal deal ${renewalDeal.id}: seeded ${renewalLineItemsSeeded} line item(s) ` +
                 `from ${recurringForRenewal.length} source recurring line item(s) ` +
-                `(${grouped.size} distinct product${grouped.size === 1 ? '' : 's'})`
+                `(${grouped.size} distinct product${grouped.size === 1 ? '' : 's'}, ` +
+                `amount=${renewalDealAmount})`
               );
             } catch (batchLineErr) {
               const partial = batchLineErr?.response?.data?.results || [];
@@ -1338,7 +1376,7 @@ exports.main = async (event, callback) => {
         console.log(
           `Renewal deal ${renewalDeal.id} auto-created for contract ${contract.id} ` +
           `(${fmtDateForHS(nextStart)} → ${fmtDateForHS(nextEnd)}, closedate=${derivedEndDate}, ` +
-          `lineItems=${renewalLineItemsSeeded})`
+          `amount=${renewalDealAmount}, lineItems=${renewalLineItemsSeeded})`
         );
       } catch (renewalErr) {
         // Failing to spawn the renewal deal must NOT fail the contract creation.
@@ -1356,10 +1394,12 @@ exports.main = async (event, callback) => {
         recurringLineItems: recurringLineItems.length,
         oneTimeLineItems,
         totalArr,
+        totalTcv,
         status: determineStatus(derivedStartDate, derivedEndDate),
         renewalDealId,
         renewalDealClosedate,
         renewalLineItemsSeeded,
+        renewalDealAmount,
         contractLineItemsCopied,
         errorMessage: segmentErrors.length ? segmentErrors.slice(0, 3).join(' | ') : '',
       },
@@ -1386,10 +1426,12 @@ exports.main = async (event, callback) => {
         recurringLineItems: 0,
         oneTimeLineItems: 0,
         totalArr: 0,
+        totalTcv: 0,
         status: '',
         renewalDealId: '',
         renewalDealClosedate: '',
         renewalLineItemsSeeded: 0,
+        renewalDealAmount: 0,
         contractLineItemsCopied: 0,
         errorMessage: safeMessage,
       },
