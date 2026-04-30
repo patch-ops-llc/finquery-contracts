@@ -11,6 +11,16 @@
  *   lands in the correct forecast quarter. Amendment / expansion / contraction
  *   deals never spawn a renewal here (per Apr 28 training session).
  *
+ * Renewal deal shape (per Apr 30 correction):
+ * - Term: inherits the FULL term of the source contract (e.g. a 3-year source
+ *   spawns a 3-year renewal), not a fixed 1-year window.
+ * - Line items: NONE. Renewals are placeholders for DealHub to quote into;
+ *   we used to seed final-year recurring lines but that was wrong — the
+ *   renewal deal stays empty until DealHub configures it.
+ * - Amount: TCV of the source contract minus any one-time fees (i.e. the
+ *   recurring TCV) so the forecast reflects the full multi-year renewal
+ *   value instead of one annualized year.
+ *
  * Workflow trigger requirements (configure in HubSpot UI):
  * - Trigger on Deal stage = Closed Won
  * - Filter OUT amendment / expansion / contraction deals — this action only
@@ -33,8 +43,9 @@
  *    - status (string)
  *    - renewalDealId (string)             — populated for new_business / renewal closes
  *    - renewalDealClosedate (string)      — YYYY-MM-DD; matches the new contract's end date
- *    - renewalLineItemsSeeded (number)    — # of line items copied onto the renewal deal
- *    - renewalDealAmount (number)         — amount on the auto-spawned renewal deal (annual ARR)
+ *    - renewalLineItemsSeeded (number)    — always 0; renewals no longer seed line items (left for output-field stability)
+ *    - renewalDealAmount (number)         — amount on the auto-spawned renewal deal (recurring TCV; one-time fees excluded)
+ *    - renewalDealTermMonths (number)     — term of the spawned renewal deal in months (matches source contract term)
  *    - contractLineItemsCopied (number)   — # of source deal line items mirrored onto the contract
  *    - errorMessage (string)
  */
@@ -384,20 +395,6 @@ async function getObject(hs, typeId, objectId, properties) {
 async function createObject(hs, typeId, properties) {
   const { data } = await hs.post(`/crm/v3/objects/${typeId}`, { properties });
   return data;
-}
-
-// Recurring billing periods we care about when seeding renewal line items.
-// We treat anything explicitly recurring (or implicitly recurring per
-// isRecurringLineItem) as eligible. One-time charges are never inherited
-// onto the next-cycle renewal deal because they live on the source contract
-// as line items only.
-function dealLineItemRenewalPeriod(lineItem) {
-  const props = lineItem?.properties || {};
-  const period = String(props.hs_recurring_billing_period || '').trim();
-  if (period && !/^one[_-]?time$/i.test(period)) return period;
-  if (period && /^one[_-]?time$/i.test(period)) return null;
-  // Default cadence when the source line item does not specify one.
-  return 'P12M';
 }
 
 async function getAssociatedIds(hs, fromType, fromId, toType) {
@@ -1196,77 +1193,44 @@ exports.main = async (event, callback) => {
     // forecast for the contract's end-date quarter. Only fires for new
     // business + renewal categories; amendments / expansions / contractions
     // never spawn renewal deals from this workflow.
+    //
+    // Per Apr 30 correction:
+    //   • Term: the renewal deal inherits the FULL TERM of the source contract
+    //     (a 3-year source spawns a 3-year renewal), not a fixed 1-year span.
+    //   • Line items: NONE — the renewal deal is a placeholder for DealHub to
+    //     quote into. We used to seed final-year recurring lines but that was
+    //     wrong; DealHub builds the renewal product set from scratch.
+    //   • Amount: source contract's recurring TCV (TCV minus any one-time
+    //     fees). totalTcv is already computed from recurring line items only,
+    //     so it equals (deal TCV − one-time fees) by construction.
     let renewalDealId = '';
     let renewalDealClosedate = '';
     let renewalLineItemsSeeded = 0;
     let renewalDealAmount = 0;
+    let renewalDealTermMonths = 0;
     const renewalEligibleCategories = ['new_business', 'renewal'];
     if (renewalEligibleCategories.includes(category)) {
       try {
-        // We just created this contract -- the only deal on it is the source
-        // deal that triggered this workflow, so there cannot be an existing
-        // open renewal deal. Skip the peek that previously cost N+1
-        // sequential round-trips.
+        // Inherit the full source-contract term. Fall back to 12 months only
+        // when we couldn't compute a real term from the source dates.
+        const renewalTermMonths = computedTermMonths != null && computedTermMonths > 0
+          ? computedTermMonths
+          : 12;
+        renewalDealTermMonths = renewalTermMonths;
+
         const nextStart = parseDateValue(derivedEndDate) || new Date();
         nextStart.setUTCDate(nextStart.getUTCDate() + 1);
-        const nextEnd = new Date(nextStart);
-        nextEnd.setUTCFullYear(nextEnd.getUTCFullYear() + 1);
+        // End of the renewal term = start + termMonths - 1 day so the
+        // renewal spans exactly the same number of months as the source
+        // contract (mirrors the line-item span helpers above).
+        const nextEnd = addDays(addMonths(nextStart, renewalTermMonths), -1);
         renewalDealClosedate = derivedEndDate;
 
-        // ── Build the renewal line item set FIRST so we can use its summed
-        // amount as the renewal deal's `amount`. This guarantees the deal
-        // amount matches the seeded line items (one year of recurring
-        // revenue) instead of the source contract's TCV — the previous
-        // behavior made a 3-year contract spawn a renewal deal showing 3×
-        // the real next-year ACV.
-        //
-        // Dedup recurring source line items by product (sku preferred, fall
-        // back to name) so a single product split across multiple source
-        // line items collapses to a single renewal line with summed
-        // quantity + amount. One-time / setup / training charges are
-        // filtered out via `isRecurringLineItem`.
-        const recurringForRenewal = lineItems.filter(isRecurringLineItem);
-        const grouped = new Map();
-        for (const li of recurringForRenewal) {
-          const lp = li.properties || {};
-          const sku = String(lp.hs_sku || '').trim();
-          const name = String(lp.name || 'Product').trim() || 'Product';
-          const key = (sku || name).toLowerCase();
-          const qty = Math.max(0, Number(lp.quantity) || 0) || 1;
-          const unitPrice = Math.max(0, Number(lp.price) || 0);
-          const lineAmount = qty * unitPrice;
-          const period = dealLineItemRenewalPeriod(li) || 'P12M';
-
-          if (!grouped.has(key)) {
-            grouped.set(key, {
-              name,
-              sku,
-              quantity: 0,
-              amount: 0,
-              period,
-              hasExpansion: false,
-            });
-          }
-          const g = grouped.get(key);
-          g.quantity += qty;
-          g.amount += lineAmount;
-          if (!g.sku && sku) g.sku = sku;
-          if (period) g.period = period;
-
-          const lineRevenue = String(lp.revenue_type || '').toLowerCase().trim();
-          if (lineRevenue === 'expansion' || lineRevenue === 'cross_sell' || lineRevenue === 'new') {
-            g.hasExpansion = true;
-          }
-        }
-
-        // Sum the grouped line item amounts to derive the renewal deal's
-        // amount. Falls back to totalArr (annual ARR) when the source deal
-        // has no recurring lines so the deal still has a sensible amount.
-        let renewalGroupedAmount = 0;
-        for (const item of grouped.values()) {
-          renewalGroupedAmount += Number(item.amount) || 0;
-        }
-        renewalDealAmount = renewalGroupedAmount > 0 ? renewalGroupedAmount : (totalArr || 0);
+        // Renewal deal amount = recurring TCV of the source contract.
+        // totalTcv is summed from recurring line items only (one-time
+        // charges are excluded earlier in this workflow), so this is
+        // exactly "TCV minus one-time fees" without any extra subtraction.
+        renewalDealAmount = totalTcv > 0 ? totalTcv : (totalArr * (renewalTermMonths / 12));
 
         const renewalDealName = `${cleanedContractName} — Renewal`;
         const renewalDeal = await createObject(hs, '0-3', {
@@ -1283,7 +1247,9 @@ exports.main = async (event, callback) => {
 
         // Wire up the renewal deal to the contract, company, and contacts in
         // parallel. Each handler swallows its own error so a single bad
-        // association cannot prevent the others from completing.
+        // association cannot prevent the others from completing. NOTE: no
+        // line items are seeded — DealHub configures the renewal product
+        // set from scratch when quoting.
         await Promise.all([
           associateWithFallback(hs, contractTypeId, contract.id, '0-3', renewalDeal.id).catch((err) => {
             console.warn(`Renewal deal -> contract association failed: ${err.message}`);
@@ -1305,78 +1271,11 @@ exports.main = async (event, callback) => {
             : Promise.resolve(),
         ]);
 
-        // Seed the renewal deal with ONE line item per recurring product
-        // (already grouped above). We do NOT pull from the new contract's
-        // subscription segments here -- segments span every year of the
-        // term, and naively inheriting them would result in N copies of
-        // each product (one per year) on the renewal deal.
-        try {
-          if (!recurringForRenewal.length) {
-            console.log(
-              `Renewal deal ${renewalDeal.id}: no recurring line items on source deal — leaving renewal deal empty.`
-            );
-          } else {
-            // Stamp every seeded renewal line item with the new term's start
-            // / end dates. Keeps the renewal deal's recurring lines in lock
-            // step with the deal-level contract_start_date / contract_end_date
-            // so finance never sees a renewal line missing its span.
-            const renewalLineStart = fmtDateForHS(nextStart);
-            const renewalLineEnd = fmtDateForHS(nextEnd);
-
-            const renewalLineInputs = [];
-            for (const item of grouped.values()) {
-              const quantity = Math.max(1, Math.round(item.quantity || 0));
-              const unitPrice = quantity > 0 ? item.amount / quantity : item.amount;
-              const lineProperties = {
-                name: item.name,
-                quantity: String(quantity),
-                price: (Math.round(unitPrice * 100) / 100).toFixed(2),
-                hs_sku: item.sku || '',
-                hs_recurring_billing_period: item.period || 'P12M',
-                revenue_type: item.hasExpansion ? 'expansion' : 'renewal',
-              };
-              if (renewalLineStart) lineProperties.hs_recurring_billing_start_date = renewalLineStart;
-              if (renewalLineEnd) lineProperties.hs_recurring_billing_end_date = renewalLineEnd;
-              renewalLineInputs.push({
-                properties: lineProperties,
-                associations: [
-                  {
-                    to: { id: String(renewalDeal.id) },
-                    types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 20 }],
-                  },
-                ],
-              });
-            }
-
-            try {
-              const { data: liResp } = await hs.post('/crm/v3/objects/line_items/batch/create', {
-                inputs: renewalLineInputs,
-              });
-              renewalLineItemsSeeded = (liResp?.results || []).length;
-              console.log(
-                `Renewal deal ${renewalDeal.id}: seeded ${renewalLineItemsSeeded} line item(s) ` +
-                `from ${recurringForRenewal.length} source recurring line item(s) ` +
-                `(${grouped.size} distinct product${grouped.size === 1 ? '' : 's'}, ` +
-                `amount=${renewalDealAmount})`
-              );
-            } catch (batchLineErr) {
-              const partial = batchLineErr?.response?.data?.results || [];
-              renewalLineItemsSeeded = partial.length;
-              console.warn(
-                `Renewal deal ${renewalDeal.id}: batch line item create failed: ${parseHubSpotErrorMessage(batchLineErr)}. ` +
-                `${renewalLineItemsSeeded} line(s) created before failure.`
-              );
-            }
-          }
-        } catch (seedErr) {
-          // Line item seeding must NEVER prevent the renewal deal from existing.
-          console.warn(`Renewal deal ${renewalDeal.id} line-item seeding failed: ${seedErr.message}`);
-        }
-
         console.log(
           `Renewal deal ${renewalDeal.id} auto-created for contract ${contract.id} ` +
-          `(${fmtDateForHS(nextStart)} → ${fmtDateForHS(nextEnd)}, closedate=${derivedEndDate}, ` +
-          `amount=${renewalDealAmount}, lineItems=${renewalLineItemsSeeded})`
+          `(${fmtDateForHS(nextStart)} → ${fmtDateForHS(nextEnd)}, ` +
+          `term=${renewalTermMonths}mo, closedate=${derivedEndDate}, ` +
+          `amount=${renewalDealAmount} [recurring TCV], no line items seeded)`
         );
       } catch (renewalErr) {
         // Failing to spawn the renewal deal must NOT fail the contract creation.
@@ -1400,6 +1299,7 @@ exports.main = async (event, callback) => {
         renewalDealClosedate,
         renewalLineItemsSeeded,
         renewalDealAmount,
+        renewalDealTermMonths,
         contractLineItemsCopied,
         errorMessage: segmentErrors.length ? segmentErrors.slice(0, 3).join(' | ') : '',
       },
@@ -1432,6 +1332,7 @@ exports.main = async (event, callback) => {
         renewalDealClosedate: '',
         renewalLineItemsSeeded: 0,
         renewalDealAmount: 0,
+        renewalDealTermMonths: 0,
         contractLineItemsCopied: 0,
         errorMessage: safeMessage,
       },

@@ -2059,6 +2059,39 @@ app.get('/api/reverse-termination', async (req, res) => {
   }
 });
 
+// ── Helper: Resolve renewal term + amount for a contract ────────────────────
+// Renewal deals inherit the FULL term of the source contract (e.g. a 3-year
+// contract spawns a 3-year renewal) and the amount is the source contract's
+// recurring TCV — i.e. TCV minus any one-time fees.
+//
+// total_tcv on the contract is rolled up from subscription segments only
+// (created from recurring line items), so it already excludes one-time
+// charges and equals "TCV − one-time fees" by construction. When the field
+// is missing/zero we fall back to total_arr × term-years so a contract that
+// hasn't been re-rollup'd still spawns a sensible renewal amount.
+function resolveRenewalTermMonths(props = {}) {
+  const explicit = parseInt(props.contract_term, 10);
+  if (Number.isFinite(explicit) && explicit > 0) return explicit;
+
+  const start = parseDateValue(getContractStartDate(props));
+  const end = parseDateValue(getContractEndDate(props));
+  if (!start || !end || start > end) return 12;
+
+  const months =
+    (end.getFullYear() - start.getFullYear()) * 12 +
+    (end.getMonth() - start.getMonth()) +
+    (end.getDate() >= start.getDate() ? 1 : 0);
+  return months > 0 ? months : 12;
+}
+
+function resolveRenewalAmount(props = {}, termMonths = 12) {
+  const tcv = Number(props.total_tcv);
+  if (Number.isFinite(tcv) && tcv > 0) return tcv;
+  const arr = Number(props.total_arr) || 0;
+  const years = termMonths / 12;
+  return arr * years;
+}
+
 // ── Helper: Create a renewal deal for a given contract ───────────────────────
 // Shared by:
 //   - /api/create-renewal-deal (manual click from the contract card)
@@ -2066,6 +2099,14 @@ app.get('/api/reverse-termination', async (req, res) => {
 //     and renewal deals; per Apr 28 training: renewals are now generated
 //     immediately on Closed Won so the next-cycle deal shows in the forecast,
 //     not at end-of-term + 1)
+//
+// Per Apr 30 correction:
+//   • Term: inherits the full source-contract term (12 / 24 / 36 mo etc.).
+//   • Line items: NONE — DealHub configures the renewal product set from
+//     scratch when quoting. We no longer seed final-year recurring lines.
+//   • Amount: source recurring TCV (total_tcv on the contract already
+//     excludes one-time fees).
+//
 // Returns { success, dealId, dealName, lineItemsCreated, warnings, existing? }.
 async function createRenewalDealForContract(contractId, options = {}) {
   const {
@@ -2082,11 +2123,16 @@ async function createRenewalDealForContract(contractId, options = {}) {
   const props = contractPropsOverride
     || (await getObject(contractTypeId, contractId, CONTRACT_PROPS)).properties;
 
+  const termMonths = resolveRenewalTermMonths(props);
+  const renewalAmount = resolveRenewalAmount(props, termMonths);
+
   const currentEndDate = parseDateValue(getContractEndDate(props)) || new Date();
   const renewalStart = new Date(currentEndDate);
   renewalStart.setDate(renewalStart.getDate() + 1);
-  const renewalEnd = new Date(renewalStart);
-  renewalEnd.setFullYear(renewalEnd.getFullYear() + 1);
+  // Inherit the source contract's term length. addMonthsToDate followed by
+  // -1 day keeps the renewal end aligned to the same day-of-month as the
+  // source start (e.g. 5/15 → 5/14 of the renewal year).
+  const renewalEnd = addDaysToDate(addMonthsToDate(renewalStart, termMonths), -1);
 
   const dealName = `${props.contract_name || 'Contract'} — ${nameSuffix}`;
   const warnings = [];
@@ -2136,7 +2182,7 @@ async function createRenewalDealForContract(contractId, options = {}) {
     contract_start_date: fmtDateForHS(renewalStart),
     contract_end_date: fmtDateForHS(renewalEnd),
     closedate: closeDate,
-    amount: props.total_arr || '0',
+    amount: String(renewalAmount),
     pipeline,
   });
 
@@ -2170,28 +2216,17 @@ async function createRenewalDealForContract(contractId, options = {}) {
     warnings.push(`${contactIds.length - contactsLinked} of ${contactIds.length} contact associations failed (likely deleted contacts)`);
   }
 
-  const seeded = await syncContractRecurringLineItemsToDeal(contractId, deal.id, {
-    fallbackRevenueType: 'renewal',
-    lineItemDates: {
-      startDate: fmtDateForHS(renewalStart),
-      endDate: fmtDateForHS(renewalEnd),
-    },
-  });
-  const lineItemsCreated = seeded.lineItemsCreated + seeded.lineItemsUpdated;
-  if (seeded.warnings?.length) warnings.push(...seeded.warnings);
-
-  if (lineItemsCreated === 0) {
-    warnings.unshift(
-      `No line items were seeded on the renewal deal (source: ${seeded.inheritanceSource}). ` +
-      `Check that the contract has subscription segments with status active/future or recurring contract line items.`
-    );
-  }
+  // Renewal deals do NOT carry line items — DealHub builds the renewal
+  // product set from scratch when quoting. The deal's `amount` already
+  // reflects the recurring TCV so finance has a forecast number to work
+  // with until DealHub fills in the products.
+  const lineItemsCreated = 0;
 
   console.log(
     `[renewal-helper] Created renewal deal ${deal.id} for contract ${contractId}: ` +
-    `${seeded.lineItemsCreated} created, ${seeded.lineItemsUpdated} updated, ` +
-    `${seeded.lineItemsRemoved} removed, closeDate=${closeDate} ` +
-    `(${fmtDateForHS(renewalStart)} → ${fmtDateForHS(renewalEnd)})`
+    `term=${termMonths}mo, amount=${renewalAmount} [recurring TCV], ` +
+    `closeDate=${closeDate} (${fmtDateForHS(renewalStart)} → ${fmtDateForHS(renewalEnd)}), ` +
+    `no line items seeded (DealHub configures on quote)`
   );
 
   return {
@@ -2201,10 +2236,12 @@ async function createRenewalDealForContract(contractId, options = {}) {
     dealName,
     contactsLinked,
     lineItemsCreated,
-    lineItemsFailed: seeded.lineItemsFailed || 0,
-    inheritanceSource: seeded.inheritanceSource,
+    lineItemsFailed: 0,
+    inheritanceSource: 'none',
     renewalStart: fmtDateForHS(renewalStart),
     renewalEnd: fmtDateForHS(renewalEnd),
+    termMonths,
+    amount: renewalAmount,
     closeDate,
     warnings,
   };
@@ -2234,15 +2271,18 @@ app.get('/api/create-renewal-deal', async (req, res) => {
 
     res.json({
       success: true,
-      message: result.lineItemsCreated > 0
-        ? `Renewal deal created with ${result.lineItemsCreated} line item(s): ${result.renewalStart} → ${result.renewalEnd}`
-        : `Renewal deal created (no line items seeded): ${result.renewalStart} → ${result.renewalEnd}`,
+      message:
+        `Renewal deal created (${result.termMonths}-month term, ` +
+        `amount = recurring TCV $${Number(result.amount || 0).toLocaleString()}): ` +
+        `${result.renewalStart} → ${result.renewalEnd}. ` +
+        `DealHub will configure the product set on quote.`,
       dealId: result.dealId,
       dealName: result.dealName,
       contactsLinked: result.contactsLinked,
       lineItemsCreated: result.lineItemsCreated,
       lineItemsFailed: result.lineItemsFailed,
-      inheritanceSource: result.inheritanceSource,
+      termMonths: result.termMonths,
+      amount: result.amount,
       closeDate: result.closeDate,
       warnings: result.warnings && result.warnings.length > 0 ? result.warnings : undefined,
     });
@@ -2301,69 +2341,37 @@ app.get('/api/trigger-auto-renewal', async (req, res) => {
       return res.json({ success: true, message: 'Auto-renewal already released', alreadyReleased: true });
     }
 
-    const currentEnd = parseDateValue(getContractEndDate(props)) || new Date();
-    const renewalStart = new Date(currentEnd);
-    renewalStart.setDate(renewalStart.getDate() + 1);
-    const renewalEnd = new Date(renewalStart);
-    renewalEnd.setFullYear(renewalEnd.getFullYear() + 1);
-
-    const dealName = `${props.contract_name || 'Contract'} — Auto-Renewal`;
-
-    const deal = await createObject('0-3', {
-      dealname: dealName,
-      dealstage: RENEWAL_DEAL_STAGE,
-      deal_category: 'renewal',
-      contract_start_date: fmtDateForHS(renewalStart),
-      contract_end_date: fmtDateForHS(renewalEnd),
-      amount: props.total_arr || '0',
-      pipeline: RENEWAL_PIPELINE_ID,
+    // Reuse the shared helper so auto-renewal and manual renewal stay in
+    // lockstep on term + amount + line-item policy. Skip the open-renewal
+    // peek because auto-renewal deliberately fires regardless of pipeline.
+    const result = await createRenewalDealForContract(contractId, {
+      nameSuffix: 'Auto-Renewal',
+      contractPropsOverride: props,
+      skipIfOpenRenewalExists: false,
     });
-
-    const warnings = [];
-
-    const companyIds = await getAssociatedIds(contractTypeId, contractId, '0-2');
-    if (companyIds.length > 0) {
-      try { await createAssociation('0-3', deal.id, '0-2', companyIds[0]); }
-      catch (e) { warnings.push('Company association failed'); }
-    }
-
-    try { await createAssociation(contractTypeId, contractId, '0-3', deal.id); }
-    catch (e) { /* ok */ }
-
-    const contactIds = await getAssociatedIds(contractTypeId, contractId, '0-1');
-    let contactsLinked = 0;
-    for (const cid of contactIds) {
-      try { await createAssociation('0-3', deal.id, '0-1', cid); contactsLinked++; }
-      catch (e) { /* skip invalid */ }
-    }
-
-    const seeded = await syncContractRecurringLineItemsToDeal(contractId, deal.id, {
-      fallbackRevenueType: 'renewal',
-      lineItemDates: {
-        startDate: fmtDateForHS(renewalStart),
-        endDate: fmtDateForHS(renewalEnd),
-      },
-    });
-    const lineItemsCreated = seeded.lineItemsCreated + seeded.lineItemsUpdated;
-    if (seeded.warnings?.length) warnings.push(...seeded.warnings);
 
     await updateObject(contractTypeId, contractId, {
       auto_renewal_released: 'true',
     });
 
     console.log(
-      `[trigger-auto-renewal] Released for contract ${contractId}: deal ${deal.id}, ` +
-      `${seeded.lineItemsCreated} created, ${seeded.lineItemsUpdated} updated, ${seeded.lineItemsRemoved} removed`
+      `[trigger-auto-renewal] Released for contract ${contractId}: deal ${result.dealId}, ` +
+      `term=${result.termMonths}mo, amount=${result.amount} [recurring TCV], no line items`
     );
 
     res.json({
       success: true,
-      message: `Auto-renewal deal created: ${fmtDateForHS(renewalStart)} → ${fmtDateForHS(renewalEnd)}`,
-      dealId: deal.id,
-      dealName,
-      contactsLinked,
-      lineItemsCreated,
-      warnings: warnings.length > 0 ? warnings : undefined,
+      message:
+        `Auto-renewal deal created (${result.termMonths}-month term, ` +
+        `amount = recurring TCV $${Number(result.amount || 0).toLocaleString()}): ` +
+        `${result.renewalStart} → ${result.renewalEnd}`,
+      dealId: result.dealId,
+      dealName: result.dealName,
+      contactsLinked: result.contactsLinked,
+      lineItemsCreated: result.lineItemsCreated,
+      termMonths: result.termMonths,
+      amount: result.amount,
+      warnings: result.warnings && result.warnings.length > 0 ? result.warnings : undefined,
     });
   } catch (e) {
     console.error('[trigger-auto-renewal] Error:', e.response?.data || e.message);
@@ -2381,6 +2389,9 @@ app.get('/api/check-auto-renewals', async (req, res) => {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
+    // Pull total_tcv + contract_term so resolveRenewalAmount /
+    // resolveRenewalTermMonths can reuse the same logic as the manual
+    // renewal helper without an extra round-trip per contract.
     const { data } = await hs.post(`/crm/v3/objects/${contractTypeId}/search`, {
       filterGroups: [{
         filters: [
@@ -2391,7 +2402,8 @@ app.get('/api/check-auto-renewals', async (req, res) => {
       }],
       properties: [
         'contract_name', 'auto_renewal_date', 'auto_renewal_released', 'status',
-        'enddate', 'contract_end_date', 'co_term_date', 'total_arr',
+        'startdate', 'enddate', 'contract_start_date', 'contract_end_date', 'co_term_date',
+        'contract_term', 'total_arr', 'total_tcv',
       ],
       limit: 100,
     });
@@ -2403,49 +2415,31 @@ app.get('/api/check-auto-renewals', async (req, res) => {
     const results = [];
     for (const c of candidates) {
       try {
-        const cp = c.properties;
-        const currentEnd = parseDateValue(getContractEndDate(cp)) || new Date();
-        const renewalStart = new Date(currentEnd);
-        renewalStart.setDate(renewalStart.getDate() + 1);
-        const renewalEnd = new Date(renewalStart);
-        renewalEnd.setFullYear(renewalEnd.getFullYear() + 1);
-
-        const dealName = `${cp.contract_name || 'Contract'} — Auto-Renewal`;
-        const deal = await createObject('0-3', {
-          dealname: dealName,
-          dealstage: RENEWAL_DEAL_STAGE,
-          deal_category: 'renewal',
-          contract_start_date: fmtDateForHS(renewalStart),
-          contract_end_date: fmtDateForHS(renewalEnd),
-          amount: cp.total_arr || '0',
-          pipeline: RENEWAL_PIPELINE_ID,
-        });
-
-        try { await createAssociation(contractTypeId, c.id, '0-3', deal.id); } catch (e) { /* ok */ }
-        const companyIds = await getAssociatedIds(contractTypeId, c.id, '0-2');
-        if (companyIds.length > 0) {
-          try { await createAssociation('0-3', deal.id, '0-2', companyIds[0]); } catch (e) { /* ok */ }
-        }
-
-        const seeded = await syncContractRecurringLineItemsToDeal(c.id, deal.id, {
-          fallbackRevenueType: 'renewal',
-          lineItemDates: {
-            startDate: fmtDateForHS(renewalStart),
-            endDate: fmtDateForHS(renewalEnd),
-          },
+        // Reuse the shared helper so auto-renewal honors the same term +
+        // amount + line-item policy as manual renewal (full source-contract
+        // term, recurring TCV amount, no line items seeded).
+        const result = await createRenewalDealForContract(c.id, {
+          nameSuffix: 'Auto-Renewal',
+          contractPropsOverride: c.properties,
+          skipIfOpenRenewalExists: false,
         });
 
         await updateObject(contractTypeId, c.id, { auto_renewal_released: 'true' });
 
         results.push({
           contractId: c.id,
-          name: cp.contract_name,
-          dealId: deal.id,
-          dealName,
-          lineItemsSynced: seeded.lineItemsCreated + seeded.lineItemsUpdated,
+          name: c.properties.contract_name,
+          dealId: result.dealId,
+          dealName: result.dealName,
+          termMonths: result.termMonths,
+          amount: result.amount,
+          lineItemsSynced: result.lineItemsCreated,
           status: 'released',
         });
-        console.log(`[check-auto-renewals] Released: ${cp.contract_name} → deal ${deal.id}`);
+        console.log(
+          `[check-auto-renewals] Released: ${c.properties.contract_name} → deal ${result.dealId} ` +
+          `(${result.termMonths}mo, amount=${result.amount})`
+        );
       } catch (e) {
         results.push({ contractId: c.id, name: c.properties.contract_name, error: e.message });
       }
