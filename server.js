@@ -181,8 +181,11 @@ const CONTRACT_SCHEMA = {
     },
 
     // ── Dates ────────────────────────────────────────────────────────────
-    { name: 'contract_start_date', label: 'Contract Start Date', type: 'date', fieldType: 'date' },
-    { name: 'contract_end_date', label: 'Contract End Date', type: 'date', fieldType: 'date' },
+    // NOTE: the contract object's start/end date internal names are
+    // `startdate`/`enddate` (NOT `contract_start_date`/`contract_end_date`).
+    // The deal-level custom properties further down keep the longer names.
+    { name: 'startdate', label: 'Contract Start Date', type: 'date', fieldType: 'date' },
+    { name: 'enddate', label: 'Contract End Date', type: 'date', fieldType: 'date' },
     { name: 'co_term_date', label: 'Co-Term Date', type: 'date', fieldType: 'date' },
     { name: 'activated_date', label: 'Activated Date', type: 'date', fieldType: 'date' },
     { name: 'terminated_date', label: 'Terminated Date', type: 'date', fieldType: 'date' },
@@ -485,7 +488,7 @@ const DEAL_PROPERTIES = [
 const CONTRACT_PROPS = [
   'contract_name', 'contract_number', 'sf_contract_id', 'description',
   'status', 'termination_reason',
-  'contract_start_date', 'contract_end_date', 'co_term_date', 'activated_date', 'terminated_date',
+  'startdate', 'enddate', 'co_term_date', 'activated_date', 'terminated_date',
   'company_signed_date', 'customer_signed_date', 'customer_signed_title',
   'amendment_start_date', 'contract_renewed_on',
   'contract_term', 'previous_contract_term', 'renewal_term', 'evergreen',
@@ -721,8 +724,16 @@ function parseDateValue(value) {
   return null;
 }
 
+// The contract object's start/end dates live on `startdate` / `enddate`
+// internally. The deal-level `contract_start_date` / `contract_end_date`
+// values are kept as legacy fallbacks so any pre-existing contract that was
+// imported with the long-form names still resolves.
+function getContractStartDate(props = {}) {
+  return props.startdate || props.contract_start_date || null;
+}
+
 function getContractEndDate(props = {}) {
-  return props.contract_end_date || props.co_term_date || null;
+  return props.enddate || props.contract_end_date || props.co_term_date || null;
 }
 
 function parseDateToMillis(value) {
@@ -767,6 +778,71 @@ function addDaysToDate(dateObj, days) {
   const d = new Date(dateObj);
   d.setDate(d.getDate() + days);
   return d;
+}
+
+function addMonthsToDate(dateObj, months) {
+  const d = new Date(dateObj);
+  d.setMonth(d.getMonth() + months);
+  return d;
+}
+
+// Parses ISO 8601 duration strings (HubSpot uses "P<n>M" / "P<n>Y" for billing
+// periods) plus the legacy "annual"/"monthly"/etc. tokens FinQuery still ships
+// on some imported line items. Returns months as a number, or null when the
+// input is unparseable.
+function parsePeriodMonths(period) {
+  const raw = String(period || '').trim();
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+  if (lower === 'one_time' || lower === 'onetime') return null;
+  if (lower === 'annual' || lower === 'yearly') return 12;
+  if (lower === 'semi_annual' || lower === 'semi-annual') return 6;
+  if (lower === 'quarterly') return 3;
+  if (lower === 'monthly') return 1;
+  const iso = raw.toUpperCase().match(/^P(\d+)([MY])$/);
+  if (!iso) return null;
+  const num = Number(iso[1]);
+  if (!Number.isFinite(num) || num <= 0) return null;
+  return iso[2] === 'Y' ? num * 12 : num;
+}
+
+// Determines the [start, end] span for a single line item, preferring the line
+// item's own billing dates / term over the contract's dates. Used by
+// copyLineItemsToContract (so the contract line item carries real dates) and
+// createSegmentsFromLineItems (so a 3-year line item produces 3 segments even
+// when the deal-level contract dates were misconfigured).
+//   1. start = hs_recurring_billing_start_date, else fallback
+//   2. end   = hs_recurring_billing_end_date, else
+//              start + (number_of_payments × period months) - 1 day, else
+//              start + hs_term_in_months - 1 day, else
+//              fallback
+function resolveLineItemSpan(lineItem, fallbackStart, fallbackEnd) {
+  const lp = (lineItem && lineItem.properties) || {};
+  const start =
+    parseDateValue(lp.hs_recurring_billing_start_date) ||
+    parseDateValue(fallbackStart);
+
+  let end = parseDateValue(lp.hs_recurring_billing_end_date);
+
+  if (!end && start) {
+    const periodMonths = parsePeriodMonths(lp.hs_recurring_billing_period) || 12;
+    const numPayments = Math.max(0, Number(lp.hs_recurring_billing_number_of_payments) || 0);
+    if (numPayments > 0) {
+      end = addDaysToDate(addMonthsToDate(start, periodMonths * numPayments), -1);
+    } else {
+      const termMonths = Math.max(0, Number(lp.hs_term_in_months) || 0);
+      if (termMonths > 0) {
+        end = addDaysToDate(addMonthsToDate(start, termMonths), -1);
+      }
+    }
+  }
+
+  if (!end) end = parseDateValue(fallbackEnd);
+
+  return {
+    startDate: start ? fmtDateForHS(start) : (fallbackStart || null),
+    endDate: end ? fmtDateForHS(end) : (fallbackEnd || null),
+  };
 }
 
 // Splits a [start, end] contract span into 12-month segment buckets:
@@ -1024,6 +1100,14 @@ function stripUnsupportedLineItemProps(err, properties) {
     changed = true;
   }
 
+  if (
+    message.includes('hs_recurring_billing_end_date') &&
+    Object.prototype.hasOwnProperty.call(nextProps, 'hs_recurring_billing_end_date')
+  ) {
+    delete nextProps.hs_recurring_billing_end_date;
+    changed = true;
+  }
+
   return changed ? nextProps : null;
 }
 
@@ -1054,7 +1138,20 @@ async function updateLineItemWithFallback(lineItemId, properties) {
 }
 
 async function syncContractRecurringLineItemsToDeal(contractId, dealId, options = {}) {
-  const { fallbackRevenueType = 'renewal' } = options;
+  const {
+    fallbackRevenueType = 'renewal',
+    // Caller (renewal / amendment / auto-renewal) supplies the deal's contract
+    // span so every seeded line item carries hs_recurring_billing_start_date /
+    // hs_recurring_billing_end_date covering the new term. When omitted, we
+    // leave the per-line dates blank rather than guess.
+    lineItemDates = null,
+  } = options;
+  const lineStartDate = lineItemDates && lineItemDates.startDate
+    ? fmtDateForHS(parseDateValue(lineItemDates.startDate))
+    : null;
+  const lineEndDate = lineItemDates && lineItemDates.endDate
+    ? fmtDateForHS(parseDateValue(lineItemDates.endDate))
+    : null;
   const warnings = [];
   let recurringSourceItems = [];
   let inheritanceSource = 'none';
@@ -1387,6 +1484,8 @@ async function syncContractRecurringLineItemsToDeal(contractId, dealId, options 
       hs_recurring_billing_period: item.period || 'P12M',
       revenue_type: item.hasExpansion ? 'expansion' : normalizeLineRevenueType('', fallbackRevenueType),
     };
+    if (lineStartDate) lineProps.hs_recurring_billing_start_date = lineStartDate;
+    if (lineEndDate) lineProps.hs_recurring_billing_end_date = lineEndDate;
 
     try {
       const existing = existingByManagedKey[item.key];
@@ -1801,8 +1900,15 @@ app.get('/api/start-amendment', async (req, res) => {
     }
 
     // Always seed from current contract recurring line items for contract-origin deals.
+    // Stamp every seeded amendment line item with the amendment window so finance
+    // sees the exact span this amendment covers (start = amendment start, end =
+    // contract end / co-term).
     const seeded = await syncContractRecurringLineItemsToDeal(contractId, deal.id, {
       fallbackRevenueType: 'renewal',
+      lineItemDates: {
+        startDate: dealProps.contract_start_date,
+        endDate: dealProps.contract_end_date,
+      },
     });
     const lineItemsInherited = seeded.lineItemsCreated + seeded.lineItemsUpdated;
     if (seeded.warnings?.length) warnings.push(...seeded.warnings);
@@ -1895,7 +2001,7 @@ app.get('/api/reverse-termination', async (req, res) => {
       return res.json({ success: false, message: 'Contract is not terminated' });
     }
 
-    const newStatus = determineStatus(props.contract_start_date, props.contract_end_date);
+    const newStatus = determineStatus(getContractStartDate(props), getContractEndDate(props));
 
     await updateObject(contractTypeId, contractId, {
       status: newStatus,
@@ -2049,6 +2155,10 @@ async function createRenewalDealForContract(contractId, options = {}) {
 
   const seeded = await syncContractRecurringLineItemsToDeal(contractId, deal.id, {
     fallbackRevenueType: 'renewal',
+    lineItemDates: {
+      startDate: fmtDateForHS(renewalStart),
+      endDate: fmtDateForHS(renewalEnd),
+    },
   });
   const lineItemsCreated = seeded.lineItemsCreated + seeded.lineItemsUpdated;
   if (seeded.warnings?.length) warnings.push(...seeded.warnings);
@@ -2212,6 +2322,10 @@ app.get('/api/trigger-auto-renewal', async (req, res) => {
 
     const seeded = await syncContractRecurringLineItemsToDeal(contractId, deal.id, {
       fallbackRevenueType: 'renewal',
+      lineItemDates: {
+        startDate: fmtDateForHS(renewalStart),
+        endDate: fmtDateForHS(renewalEnd),
+      },
     });
     const lineItemsCreated = seeded.lineItemsCreated + seeded.lineItemsUpdated;
     if (seeded.warnings?.length) warnings.push(...seeded.warnings);
@@ -2258,7 +2372,10 @@ app.get('/api/check-auto-renewals', async (req, res) => {
           { propertyName: 'status', operator: 'IN', values: ['active', 'future'] },
         ],
       }],
-      properties: ['contract_name', 'auto_renewal_date', 'auto_renewal_released', 'status', 'contract_end_date', 'co_term_date', 'total_arr'],
+      properties: [
+        'contract_name', 'auto_renewal_date', 'auto_renewal_released', 'status',
+        'enddate', 'contract_end_date', 'co_term_date', 'total_arr',
+      ],
       limit: 100,
     });
 
@@ -2295,6 +2412,10 @@ app.get('/api/check-auto-renewals', async (req, res) => {
 
         const seeded = await syncContractRecurringLineItemsToDeal(c.id, deal.id, {
           fallbackRevenueType: 'renewal',
+          lineItemDates: {
+            startDate: fmtDateForHS(renewalStart),
+            endDate: fmtDateForHS(renewalEnd),
+          },
         });
 
         await updateObject(contractTypeId, c.id, { auto_renewal_released: 'true' });
@@ -2340,7 +2461,7 @@ app.get('/api/run-status-check', async (req, res) => {
       return res.json({ success: true, message: 'Contract is terminated — no status change', status: 'terminated' });
     }
 
-    const newStatus = determineStatus(props.contract_start_date, props.contract_end_date);
+    const newStatus = determineStatus(getContractStartDate(props), getContractEndDate(props));
     const updates = {};
 
     if (newStatus !== props.status) {
@@ -2424,8 +2545,8 @@ app.get('/api/load-account-rollups', async (req, res) => {
           name: cp.contract_name,
           status: cp.status,
           arr: parseFloat(cp.total_arr) || 0,
-          startDate: cp.contract_start_date,
-          endDate: cp.contract_end_date,
+          startDate: getContractStartDate(cp),
+          endDate: getContractEndDate(cp),
         });
         if (cp.status === 'active') {
           activeContracts++;
@@ -2536,12 +2657,14 @@ app.get('/api/load-company-contracts', async (req, res) => {
         }
 
         const startDate = firstDateString(
+          cp.startdate,
           cp.contract_start_date,
           cp.activated_date,
           cp.amendment_start_date,
           subDateMin !== null ? millisToDateString(subDateMin) : null,
         );
         const endDate = firstDateString(
+          cp.enddate,
           cp.contract_end_date,
           cp.co_term_date,
           subDateMax !== null ? millisToDateString(subDateMax) : null,
@@ -2582,8 +2705,8 @@ app.get('/api/load-company-contracts', async (req, res) => {
           tcv,
           startDate,
           endDate,
-          contractStartDate: cp.contract_start_date || null,
-          contractEndDate: cp.contract_end_date || null,
+          contractStartDate: getContractStartDate(cp),
+          contractEndDate: getContractEndDate(cp),
           coTermDate: cp.co_term_date,
           term: parseInt(cp.contract_term) || null,
           renewalTerm: parseInt(cp.renewal_term) || null,
@@ -2949,7 +3072,8 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
           getObject('line_items', id, [
             'name', 'quantity', 'price', 'amount', 'hs_sku', 'description',
             'hs_line_item_currency_code', 'hs_recurring_billing_period',
-            'hs_recurring_billing_start_date', 'hs_recurring_billing_terms',
+            'hs_recurring_billing_start_date', 'hs_recurring_billing_end_date',
+            'hs_recurring_billing_number_of_payments', 'hs_recurring_billing_terms',
             'recurringbillingfrequency', 'hs_acv', 'hs_arr', 'hs_mrr',
             'hs_term_in_months', 'revenue_type',
           ])
@@ -3003,7 +3127,6 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
       } = opts;
 
       const recurringItems = lineItems.filter(isRecurringLineItem);
-      const yearSegments = buildYearSegments(startDate, endDate);
       const cleanContractName = String(contractName || 'Contract').trim() || 'Contract';
       let created = 0;
       let totalArr = 0;
@@ -3018,8 +3141,17 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
         const productCode = deriveProductCode(lp);
         const lineRevType = normalizeLineRevenueType(lp.revenue_type, revenueType || '');
 
+        // Build year segments from THIS line item's own term — not the
+        // contract-level dates — so a 3-year recurring product produces 3
+        // segments even when other line items are 1- or 2-year. The deal-level
+        // startDate/endDate are only used as a fallback when the line item
+        // has no billing dates of its own.
+        const lineSpan = resolveLineItemSpan(li, startDate, endDate);
+        const yearSegments = buildYearSegments(lineSpan.startDate, lineSpan.endDate);
+
         // total_arr is the annualized ARR (one year). total_tcv is the
-        // contract-lifetime value (annual × number of yearly segments).
+        // line-lifetime value (annual × number of yearly segments for this
+        // line item).
         totalArr += annualArr;
         totalTcv += annualArr * Math.max(yearSegments.length, 1);
 
@@ -3060,8 +3192,8 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
             status: determineStatus(segYear.start_date, segYear.end_date),
             start_date: segYear.start_date,
             end_date: segYear.end_date,
-            subscription_start_date: startDate,
-            subscription_end_date: endDate,
+            subscription_start_date: lineSpan.startDate || startDate,
+            subscription_end_date: lineSpan.endDate || endDate,
             arr_start_date: segYear.start_date,
             arr_end_date: segYear.end_date,
             segment_year: String(segYear.year),
@@ -3081,7 +3213,10 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
             try { await createAssociation(subscriptionTypeId, seg.id, '0-2', companyId); } catch (e) { /* ok */ }
           }
           created++;
-          console.log(`[update-contract] Created segment ${seg.id}: ${productName} Year ${segYear.year} x${qty} @ ${unitPrice}`);
+          console.log(
+            `[update-contract] Created segment ${seg.id}: ${productName} Year ${segYear.year} ` +
+            `x${qty} @ ${unitPrice} [${segYear.start_date} → ${segYear.end_date}]`
+          );
         }
       }
 
@@ -3094,24 +3229,52 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
     }
 
     // ── Helper: copy ALL line items to contract ─────────────────────
-    async function copyLineItemsToContract(cId, lineItems) {
+    // Pass-through is intentionally generous: every term/billing/revenue
+    // field on the source deal line item is mirrored onto the contract line
+    // item so finance + DealHub see the same numbers on either record. Start
+    // and end dates are ALWAYS stamped (computed from the line item's own
+    // term when hs_recurring_billing_end_date is missing, falling back to
+    // the contract dates only as a last resort) so every contract line item
+    // has a complete span.
+    async function copyLineItemsToContract(cId, lineItems, contractDates = {}) {
+      const { startDate: contractStart = null, endDate: contractEnd = null } = contractDates;
       let created = 0;
       for (const li of lineItems) {
         const lp = li.properties || {};
+        const span = resolveLineItemSpan(li, contractStart, contractEnd);
+        const recurring = isRecurringLineItem(li);
         try {
-          const contractLineItem = await createObject('line_items', {
+          const propsRaw = {
             name: lp.name || 'Product',
             quantity: lp.quantity || '1',
             price: lp.price || '0',
             amount: lp.amount || '',
             hs_sku: lp.hs_sku || '',
             description: lp.description || '',
+            hs_line_item_currency_code: lp.hs_line_item_currency_code || '',
             hs_recurring_billing_period: lp.hs_recurring_billing_period || '',
+            hs_recurring_billing_start_date: span.startDate || lp.hs_recurring_billing_start_date || '',
+            hs_recurring_billing_end_date: span.endDate || lp.hs_recurring_billing_end_date || '',
+            hs_recurring_billing_number_of_payments: lp.hs_recurring_billing_number_of_payments || '',
+            hs_recurring_billing_terms: lp.hs_recurring_billing_terms || '',
+            recurringbillingfrequency: lp.recurringbillingfrequency || '',
+            hs_acv: lp.hs_acv || '',
+            hs_arr: lp.hs_arr || '',
+            hs_mrr: lp.hs_mrr || '',
+            hs_term_in_months: lp.hs_term_in_months || '',
             revenue_type: lp.revenue_type || '',
-          });
+          };
+          const props = {};
+          for (const [k, v] of Object.entries(propsRaw)) {
+            if (v !== '' && v !== null && v !== undefined) props[k] = String(v);
+          }
+          const contractLineItem = await createObject('line_items', props);
           await createAssociation('line_items', contractLineItem.id, contractTypeId, cId);
           created++;
-          console.log(`[update-contract] Copied line item to contract: ${lp.name} (${isRecurringLineItem(li) ? 'recurring' : 'one-time'})`);
+          console.log(
+            `[update-contract] Copied line item to contract: ${lp.name} ` +
+            `(${recurring ? 'recurring' : 'one-time'}) [${span.startDate || '?'} → ${span.endDate || '?'}]`
+          );
         } catch (e) {
           console.warn(`[update-contract] Failed to copy line item ${lp.name} to contract:`, e.response?.data?.message || e.message);
         }
@@ -3139,8 +3302,8 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
       const contract = await createObject(contractTypeId, {
         contract_name: newBusinessContractName,
         status: determineStatus(startDate, endDate),
-        contract_start_date: startDate,
-        contract_end_date: endDate,
+        startdate: startDate,
+        enddate: endDate,
         co_term_date: endDate,
         total_arr: dp.amount || '0',
         total_tcv: dp.amount || '0',
@@ -3157,7 +3320,10 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
       let segmentsCreated = 0;
       let contractLineItems = 0;
       if (lineItems.length > 0) {
-        contractLineItems = await copyLineItemsToContract(contract.id, lineItems);
+        contractLineItems = await copyLineItemsToContract(contract.id, lineItems, {
+          startDate,
+          endDate,
+        });
 
         if (subscriptionTypeId) {
           const result = await createSegmentsFromLineItems(contract.id, lineItems, {
@@ -3235,8 +3401,8 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
         const newContract = await createObject(contractTypeId, {
           contract_name: contractName,
           status: determineStatus(renewalStart, renewalEnd),
-          contract_start_date: renewalStart,
-          contract_end_date: renewalEnd,
+          startdate: renewalStart,
+          enddate: renewalEnd,
           co_term_date: renewalEnd,
           total_arr: dp.amount || cp.total_arr || '0',
           total_tcv: dp.amount || cp.total_tcv || '0',
@@ -3261,7 +3427,10 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
         let contractLineItemsCopied = 0;
         let segmentsCreated = 0;
         if (lineItems.length > 0) {
-          contractLineItemsCopied = await copyLineItemsToContract(newContract.id, lineItems);
+          contractLineItemsCopied = await copyLineItemsToContract(newContract.id, lineItems, {
+            startDate: renewalStart,
+            endDate: renewalEnd,
+          });
 
           if (subscriptionTypeId) {
             const result = await createSegmentsFromLineItems(newContract.id, lineItems, {
@@ -3345,7 +3514,10 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
           }
           console.log(`[update-contract] Removed ${existingLineItemIds.length} existing line items from contract ${cid} before ${category} replacement`);
 
-          contractLineItemsCopied = await copyLineItemsToContract(cid, lineItems);
+          contractLineItemsCopied = await copyLineItemsToContract(cid, lineItems, {
+            startDate: amendStartDate,
+            endDate: amendEndDate,
+          });
 
           if (subscriptionTypeId) {
             const result = await createSegmentsFromLineItems(cid, lineItems, {
@@ -3379,7 +3551,7 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
           newTotalArr = metrics.total_arr;
         }
 
-        updates.status = determineStatus(cp.contract_start_date, cp.contract_end_date);
+        updates.status = determineStatus(getContractStartDate(cp), getContractEndDate(cp));
 
         // Auto-terminate if amendment results in zero ARR
         if (newTotalArr <= 0 && (category === 'contraction' || category === 'amendment')) {
@@ -3418,7 +3590,7 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
       }
 
       // ── FALLBACK for other categories ────────────────────────────────
-      const newStatus = determineStatus(cp.contract_start_date, cp.contract_end_date);
+      const newStatus = determineStatus(getContractStartDate(cp), getContractEndDate(cp));
       updates.status = newStatus;
 
       if (Object.keys(updates).length > 0) {
@@ -3454,7 +3626,11 @@ app.get('/api/seed-subscriptions', async (req, res) => {
 
     const { data: searchResult } = await hs.post(`/crm/v3/objects/${contractTypeId}/search`, {
       filterGroups: [],
-      properties: ['contract_name', 'contract_number', 'status', 'contract_start_date', 'contract_end_date', 'total_arr'],
+      properties: [
+        'contract_name', 'contract_number', 'status',
+        'startdate', 'enddate', 'contract_start_date', 'contract_end_date',
+        'total_arr',
+      ],
       limit: 20,
     });
 
@@ -3475,7 +3651,7 @@ app.get('/api/seed-subscriptions', async (req, res) => {
         continue;
       }
 
-      const startDate = cp.contract_start_date || '2025-01-01';
+      const startDate = getContractStartDate(cp) || '2025-01-01';
       const startYear = new Date(startDate).getFullYear();
       const startMonth = new Date(startDate).getMonth();
       const startDay = new Date(startDate).getDate();
@@ -3519,7 +3695,7 @@ app.get('/api/seed-subscriptions', async (req, res) => {
           arr_start_date: segDate(0),
           arr_end_date: segEndDate(1),
           subscription_start_date: segDate(0),
-          subscription_end_date: cp.contract_end_date || segEndDate(3),
+          subscription_end_date: getContractEndDate(cp) || segEndDate(3),
           quantity: '200',
           unit_price: '500',
           list_price: '600',
@@ -3554,7 +3730,7 @@ app.get('/api/seed-subscriptions', async (req, res) => {
           arr_start_date: segDate(1),
           arr_end_date: segEndDate(2),
           subscription_start_date: segDate(0),
-          subscription_end_date: cp.contract_end_date || segEndDate(3),
+          subscription_end_date: getContractEndDate(cp) || segEndDate(3),
           quantity: '200',
           unit_price: '515',
           list_price: '600',
@@ -3589,7 +3765,7 @@ app.get('/api/seed-subscriptions', async (req, res) => {
           arr_start_date: segDate(2),
           arr_end_date: segEndDate(3),
           subscription_start_date: segDate(0),
-          subscription_end_date: cp.contract_end_date || segEndDate(3),
+          subscription_end_date: getContractEndDate(cp) || segEndDate(3),
           quantity: '200',
           unit_price: '530.45',
           list_price: '600',
@@ -3624,7 +3800,7 @@ app.get('/api/seed-subscriptions', async (req, res) => {
           arr_start_date: segDate(0, startMonth + 6 > 11 ? startMonth + 6 - 12 : startMonth + 6, 1),
           arr_end_date: segEndDate(2),
           subscription_start_date: segDate(0, startMonth + 6 > 11 ? startMonth + 6 - 12 : startMonth + 6, 1),
-          subscription_end_date: cp.contract_end_date || segEndDate(3),
+          subscription_end_date: getContractEndDate(cp) || segEndDate(3),
           quantity: '1',
           unit_price: '55000',
           list_price: '65000',
@@ -3660,7 +3836,7 @@ app.get('/api/seed-subscriptions', async (req, res) => {
           arr_start_date: segDate(2),
           arr_end_date: segEndDate(3),
           subscription_start_date: segDate(0, startMonth + 6 > 11 ? startMonth + 6 - 12 : startMonth + 6, 1),
-          subscription_end_date: cp.contract_end_date || segEndDate(3),
+          subscription_end_date: getContractEndDate(cp) || segEndDate(3),
           quantity: '1',
           unit_price: '56650',
           list_price: '65000',
@@ -3745,7 +3921,11 @@ app.get('/api/sweep-contract-statuses', async (req, res) => {
       const pageSize = Math.min(100, limit - scanned);
       const body = {
         filterGroups: [],
-        properties: ['contract_name', 'status', 'contract_start_date', 'contract_end_date', 'co_term_date'],
+        properties: [
+          'contract_name', 'status',
+          'startdate', 'enddate', 'contract_start_date', 'contract_end_date',
+          'co_term_date',
+        ],
         limit: pageSize,
       };
       if (after) body.after = after;
@@ -3769,7 +3949,7 @@ app.get('/api/sweep-contract-statuses', async (req, res) => {
           continue;
         }
 
-        const newStatus = determineStatus(cp.contract_start_date, getContractEndDate(cp));
+        const newStatus = determineStatus(getContractStartDate(cp), getContractEndDate(cp));
         if (!newStatus || newStatus === currentStatus) {
           unchanged++;
           continue;
@@ -3803,8 +3983,8 @@ app.get('/api/sweep-contract-statuses', async (req, res) => {
           name: cp.contract_name,
           from: currentStatus,
           to: newStatus,
-          startDate: cp.contract_start_date,
-          endDate: cp.contract_end_date,
+          startDate: getContractStartDate(cp),
+          endDate: getContractEndDate(cp),
         });
       }
 
@@ -3863,7 +4043,7 @@ app.get('/api/load-test-data', async (req, res) => {
       });
     }
 
-    const startDate = cp.contract_start_date || fmtDateForHS(new Date());
+    const startDate = getContractStartDate(cp) || fmtDateForHS(new Date());
     const endDate = getContractEndDate(cp)
       || fmtDateForHS((() => { const d = parseDateValue(startDate) || new Date(); d.setFullYear(d.getFullYear() + 3); return d; })());
 
@@ -4118,7 +4298,8 @@ app.get('/api/reports/contract-cohorts', async (req, res) => {
         filterGroups: [],
         properties: [
           'contract_name', 'contract_number', 'status',
-          'contract_start_date', 'contract_end_date', 'co_term_date',
+          'startdate', 'enddate', 'contract_start_date', 'contract_end_date',
+          'co_term_date',
           'total_arr', 'total_tcv', 'lq_arr', 'fcm_arr',
           'subscription_count',
         ],
@@ -4134,6 +4315,7 @@ app.get('/api/reports/contract-cohorts', async (req, res) => {
         scanned++;
         const cp = c.properties || {};
         const totalArr = parseFloat(cp.total_arr) || 0;
+        const startDate = getContractStartDate(cp);
         const endDate = getContractEndDate(cp);
 
         const summary = {
@@ -4141,7 +4323,7 @@ app.get('/api/reports/contract-cohorts', async (req, res) => {
           name: cp.contract_name,
           number: cp.contract_number,
           status: cp.status,
-          startDate: cp.contract_start_date,
+          startDate,
           endDate,
           totalArr,
           totalTcv: parseFloat(cp.total_tcv) || 0,
@@ -4149,7 +4331,7 @@ app.get('/api/reports/contract-cohorts', async (req, res) => {
           fcmArr: parseFloat(cp.fcm_arr) || 0,
         };
 
-        if (inWindow(cp.contract_start_date, currentQuarterStart, currentQuarterEnd)) {
+        if (inWindow(startDate, currentQuarterStart, currentQuarterEnd)) {
           startedThisQuarter.push(summary);
         }
         if (inWindow(endDate, currentQuarterStart, currentQuarterEnd)) {

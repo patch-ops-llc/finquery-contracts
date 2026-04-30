@@ -33,6 +33,7 @@
  *    - renewalDealId (string)             — populated for new_business / renewal closes
  *    - renewalDealClosedate (string)      — YYYY-MM-DD; matches the new contract's end date
  *    - renewalLineItemsSeeded (number)    — # of line items copied onto the renewal deal
+ *    - contractLineItemsCopied (number)   — # of source deal line items mirrored onto the contract
  *    - errorMessage (string)
  */
 const axios = require('axios');
@@ -45,6 +46,7 @@ const DEAL_PROPS = [
   'deal_category',
   'contract_start_date',
   'contract_end_date',
+  'hubspot_owner_id',
 ];
 
 const LINE_ITEM_PROPS = [
@@ -57,6 +59,30 @@ const LINE_ITEM_PROPS = [
   'hs_line_item_currency_code',
   'hs_recurring_billing_period',
   'hs_recurring_billing_start_date',
+  'hs_recurring_billing_end_date',
+  'hs_recurring_billing_number_of_payments',
+  'hs_recurring_billing_terms',
+  'recurringbillingfrequency',
+  'hs_acv',
+  'hs_arr',
+  'hs_mrr',
+  'hs_term_in_months',
+  'revenue_type',
+];
+
+// Fields we mirror from the source deal line item onto each contract line
+// item. Keep this in sync with railway-api/server.js copyLineItemsToContract.
+const CONTRACT_LINE_ITEM_PROPS = [
+  'name',
+  'description',
+  'quantity',
+  'price',
+  'amount',
+  'hs_sku',
+  'hs_line_item_currency_code',
+  'hs_recurring_billing_period',
+  'hs_recurring_billing_start_date',
+  'hs_recurring_billing_end_date',
   'hs_recurring_billing_number_of_payments',
   'hs_recurring_billing_terms',
   'recurringbillingfrequency',
@@ -78,8 +104,14 @@ const ONE_TIME_NAME_PATTERN =
 // missing ones on the contract schema before creating the record so the
 // workflow never fails with PROPERTY_DOESNT_EXIST in portals where the schema
 // was created with an older / leaner definition.
+// IMPORTANT: contract start/end dates use the internal property names
+// `startdate` / `enddate` on this portal (NOT `contract_start_date` /
+// `contract_end_date` — those long-form names are the deal-level custom
+// properties). Keep this list in sync with railway-api/server.js
+// CONTRACT_SCHEMA + CONTRACT_PROPS.
 const CONTRACT_REQUIRED_PROPERTIES = [
   { name: 'contract_name', label: 'Contract Name', type: 'string', fieldType: 'text', hasUniqueValue: false },
+  { name: 'contract_number', label: 'Contract Number', type: 'string', fieldType: 'text' },
   {
     name: 'status', label: 'Status', type: 'enumeration', fieldType: 'select',
     options: [
@@ -92,9 +124,14 @@ const CONTRACT_REQUIRED_PROPERTIES = [
       { label: 'Terminated', value: 'terminated' },
     ],
   },
-  { name: 'contract_start_date', label: 'Contract Start Date', type: 'date', fieldType: 'date' },
-  { name: 'contract_end_date', label: 'Contract End Date', type: 'date', fieldType: 'date' },
+  { name: 'startdate', label: 'Contract Start Date', type: 'date', fieldType: 'date' },
+  { name: 'enddate', label: 'Contract End Date', type: 'date', fieldType: 'date' },
   { name: 'co_term_date', label: 'Co-Term Date', type: 'date', fieldType: 'date' },
+  { name: 'activated_date', label: 'Activated Date', type: 'date', fieldType: 'date' },
+  { name: 'contract_term', label: 'Contract Term (months)', type: 'number', fieldType: 'number' },
+  { name: 'previous_contract_term', label: 'Previous Contract Term (months)', type: 'number', fieldType: 'number' },
+  { name: 'renewal_term', label: 'Renewal Term (months)', type: 'number', fieldType: 'number' },
+  { name: 'contract_renewed_on', label: 'Contract Renewed On', type: 'date', fieldType: 'date' },
   { name: 'total_arr', label: 'Total ARR', type: 'number', fieldType: 'number' },
   { name: 'total_tcv', label: 'Total TCV', type: 'number', fieldType: 'number' },
   { name: 'subscription_count', label: 'Subscription Count', type: 'number', fieldType: 'number' },
@@ -138,6 +175,20 @@ function determineStatus(startDate, endDate) {
   return 'active';
 }
 
+// Whole months between start and end (inclusive). Used to populate
+// contract_term / renewal_term so the contract record reflects the term
+// without requiring DealHub to write the value separately.
+function monthsBetween(startDateStr, endDateStr) {
+  const start = parseDateValue(startDateStr);
+  const end = parseDateValue(endDateStr);
+  if (!start || !end || start > end) return null;
+  const months =
+    (end.getUTCFullYear() - start.getUTCFullYear()) * 12 +
+    (end.getUTCMonth() - start.getUTCMonth()) +
+    (end.getUTCDate() >= start.getUTCDate() ? 1 : 0);
+  return months > 0 ? months : null;
+}
+
 function cleanContractName(dealName) {
   const name = String(dealName || 'Contract').trim();
   return name
@@ -156,6 +207,69 @@ function addDays(dateObj, days) {
   const d = new Date(dateObj);
   d.setUTCDate(d.getUTCDate() + days);
   return d;
+}
+
+function addMonths(dateObj, months) {
+  const d = new Date(dateObj);
+  d.setUTCMonth(d.getUTCMonth() + months);
+  return d;
+}
+
+// Parses HubSpot's ISO 8601 billing period strings ("P12M", "P1Y", ...) plus
+// the legacy "annual"/"monthly"/etc. tokens still present on imported line
+// items. Returns months as a number, or null when unparseable.
+function parsePeriodMonths(period) {
+  const raw = String(period || '').trim();
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+  if (lower === 'one_time' || lower === 'onetime') return null;
+  if (lower === 'annual' || lower === 'yearly') return 12;
+  if (lower === 'semi_annual' || lower === 'semi-annual') return 6;
+  if (lower === 'quarterly') return 3;
+  if (lower === 'monthly') return 1;
+  const iso = raw.toUpperCase().match(/^P(\d+)([MY])$/);
+  if (!iso) return null;
+  const num = Number(iso[1]);
+  if (!Number.isFinite(num) || num <= 0) return null;
+  return iso[2] === 'Y' ? num * 12 : num;
+}
+
+// Resolves the [start, end] span for a single line item, preferring its own
+// recurring billing dates / term over the deal-level contract dates so a
+// 3-year line item generates 3 segments even when the deal-level dates only
+// cover 2.
+//   1. start = hs_recurring_billing_start_date, else fallback
+//   2. end   = hs_recurring_billing_end_date, else
+//              start + (number_of_payments × period months) - 1 day, else
+//              start + hs_term_in_months - 1 day, else
+//              fallback
+function resolveLineItemSpan(lineItem, fallbackStart, fallbackEnd) {
+  const lp = (lineItem && lineItem.properties) || {};
+  const start =
+    parseDateValue(lp.hs_recurring_billing_start_date) ||
+    parseDateValue(fallbackStart);
+
+  let end = parseDateValue(lp.hs_recurring_billing_end_date);
+
+  if (!end && start) {
+    const periodMonths = parsePeriodMonths(lp.hs_recurring_billing_period) || 12;
+    const numPayments = Math.max(0, Number(lp.hs_recurring_billing_number_of_payments) || 0);
+    if (numPayments > 0) {
+      end = addDays(addMonths(start, periodMonths * numPayments), -1);
+    } else {
+      const termMonths = Math.max(0, Number(lp.hs_term_in_months) || 0);
+      if (termMonths > 0) {
+        end = addDays(addMonths(start, termMonths), -1);
+      }
+    }
+  }
+
+  if (!end) end = parseDateValue(fallbackEnd);
+
+  return {
+    startDate: start ? fmtDateForHS(start) : (fallbackStart || null),
+    endDate: end ? fmtDateForHS(end) : (fallbackEnd || null),
+  };
 }
 
 function buildYearSegments(startDateStr, endDateStr) {
@@ -697,13 +811,27 @@ exports.main = async (event, callback) => {
       fmtDateForHS(new Date());
 
     const category = String(dealProps.deal_category || 'new_business').toLowerCase();
+    const isRenewal = category === 'renewal';
+    const initialStatus = determineStatus(derivedStartDate, derivedEndDate);
+    const computedTermMonths = monthsBetween(derivedStartDate, derivedEndDate);
+    const cleanedContractNameForPayload = cleanContractName(dealProps.dealname);
+    const dealOwnerId = dealProps.hubspot_owner_id || '';
+    const todayStr = fmtDateForHS(new Date());
 
     const contractPayloadRaw = {
-      contract_name: cleanContractName(dealProps.dealname),
-      status: determineStatus(derivedStartDate, derivedEndDate),
-      contract_start_date: derivedStartDate,
-      contract_end_date: derivedEndDate,
+      contract_name: cleanedContractNameForPayload,
+      // Use the deal name as a human-readable contract number out of the
+      // gate. Customers / DealHub can overwrite later; this just keeps the
+      // record from looking blank.
+      contract_number: cleanedContractNameForPayload,
+      status: initialStatus,
+      // NOTE: internal property names are `startdate`/`enddate` on this
+      // contract object — NOT the long-form `contract_start_date`/
+      // `contract_end_date` (those are deal-level properties).
+      startdate: derivedStartDate,
+      enddate: derivedEndDate,
       co_term_date: derivedEndDate,
+      contract_term: computedTermMonths != null ? String(computedTermMonths) : '',
       total_arr: '0',
       total_tcv: '0',
       subscription_count: '0',
@@ -717,7 +845,31 @@ exports.main = async (event, callback) => {
       }),
     };
 
+    // Inherit the deal owner so the contract record isn't ownerless.
+    if (dealOwnerId) {
+      contractPayloadRaw.hubspot_owner_id = String(dealOwnerId);
+    }
+
+    // Stamp activated_date the moment we create an active contract; future
+    // contracts will get it filled when run-status-check flips them.
+    if (initialStatus === 'active') {
+      contractPayloadRaw.activated_date = todayStr;
+    }
+
+    // Renewal-only fields — make the renewal lineage visible on the new
+    // record without waiting for a follow-up update.
+    if (isRenewal) {
+      contractPayloadRaw.renewal_term = computedTermMonths != null ? String(computedTermMonths) : '';
+      contractPayloadRaw.contract_renewed_on = todayStr;
+    }
+
     const contractPayload = filterPropertiesForSchema(contractPayloadRaw, contractSchemaPropertyNames);
+    // hubspot_owner_id is a built-in property (not in the custom schema's
+    // properties array), so filterPropertiesForSchema strips it. Add it back
+    // explicitly when present.
+    if (dealOwnerId) {
+      contractPayload.hubspot_owner_id = String(dealOwnerId);
+    }
     const contractRequiredKeys = ['contract_name', 'status', 'contract_data'].filter((key) =>
       contractSchemaPropertyNames.has(key)
     );
@@ -746,7 +898,6 @@ exports.main = async (event, callback) => {
 
     let totalArr = 0;
     const segmentErrors = [];
-    const yearSegments = buildYearSegments(derivedStartDate, derivedEndDate);
 
     // One subscription segment per recurring line item per contract year. One-time
     // line items live on the contract as line items only -- they are NOT segments.
@@ -756,6 +907,10 @@ exports.main = async (event, callback) => {
     const dealRevenueType = normalizeRevenueType('', category === 'renewal' ? 'renewal' : 'new');
 
     // Build all segment payloads in one pass so we can batch-create them.
+    // Year segments are computed PER LINE ITEM from each line item's own
+    // hs_recurring_billing_start_date / end / term — not the deal-level
+    // contract dates. This ensures a 3-year line item produces 3 segments
+    // even when other line items on the same deal are 1- or 2-year.
     // Order matters here -- the response from /batch/create preserves input
     // order so we can use `created[i]` to associate the same segment that
     // came from `segmentPayloads[i]`.
@@ -770,7 +925,10 @@ exports.main = async (event, callback) => {
       const annualArr = getLineItemAnnualArr(lineItem);
       const lineRevenueType = normalizeRevenueType(lp.revenue_type, dealRevenueType);
 
-      for (const [yearIdx, segmentYear] of yearSegments.entries()) {
+      const lineSpan = resolveLineItemSpan(lineItem, derivedStartDate, derivedEndDate);
+      const lineYearSegments = buildYearSegments(lineSpan.startDate, lineSpan.endDate);
+
+      for (const [yearIdx, segmentYear] of lineYearSegments.entries()) {
         totalArr += annualArr;
 
         const segmentPayloadRaw = {
@@ -786,8 +944,8 @@ exports.main = async (event, callback) => {
           status: determineStatus(segmentYear.start_date, segmentYear.end_date),
           start_date: segmentYear.start_date,
           end_date: segmentYear.end_date,
-          subscription_start_date: derivedStartDate,
-          subscription_end_date: derivedEndDate,
+          subscription_start_date: lineSpan.startDate || derivedStartDate,
+          subscription_end_date: lineSpan.endDate || derivedEndDate,
           arr_start_date: segmentYear.start_date,
           arr_end_date: segmentYear.end_date,
           segment_year: String(segmentYear.year),
@@ -901,6 +1059,92 @@ exports.main = async (event, callback) => {
     if (segmentLabels.length && createdSegments < segmentLabels.length) {
       console.warn(
         `Only ${createdSegments}/${segmentLabels.length} segments were created. First missing: ${segmentLabels[createdSegments]}`
+      );
+    }
+
+    // ── Copy ALL deal line items onto the contract ───────────────────────────
+    // Mirrors railway-api/server.js copyLineItemsToContract: every line item
+    // (recurring + one-time) is cloned to the contract with the full set of
+    // term/billing/revenue fields preserved, and start/end dates are stamped
+    // on every line so finance always sees a complete span. Batched into one
+    // /crm/v3/objects/line_items/batch/create call so a 50-line contract
+    // costs ~1 round-trip instead of 50.
+    let contractLineItemsCopied = 0;
+    const contractLineItemErrors = [];
+    if (lineItems.length) {
+      const contractLineInputs = lineItems.map((li) => {
+        const lp = li.properties || {};
+        const span = resolveLineItemSpan(li, derivedStartDate, derivedEndDate);
+        const propsRaw = {
+          name: lp.name || 'Product',
+          description: lp.description || '',
+          quantity: lp.quantity || '1',
+          price: lp.price || '0',
+          amount: lp.amount || '',
+          hs_sku: lp.hs_sku || '',
+          hs_line_item_currency_code: lp.hs_line_item_currency_code || '',
+          hs_recurring_billing_period: lp.hs_recurring_billing_period || '',
+          hs_recurring_billing_start_date: span.startDate || lp.hs_recurring_billing_start_date || '',
+          hs_recurring_billing_end_date: span.endDate || lp.hs_recurring_billing_end_date || '',
+          hs_recurring_billing_number_of_payments: lp.hs_recurring_billing_number_of_payments || '',
+          hs_recurring_billing_terms: lp.hs_recurring_billing_terms || '',
+          recurringbillingfrequency: lp.recurringbillingfrequency || '',
+          hs_acv: lp.hs_acv || '',
+          hs_arr: lp.hs_arr || '',
+          hs_mrr: lp.hs_mrr || '',
+          hs_term_in_months: lp.hs_term_in_months || '',
+          revenue_type: lp.revenue_type || '',
+        };
+        const cleanedProps = {};
+        for (const key of CONTRACT_LINE_ITEM_PROPS) {
+          const value = propsRaw[key];
+          if (value === undefined || value === null || value === '') continue;
+          cleanedProps[key] = String(value);
+        }
+        return { properties: cleanedProps };
+      });
+
+      let createdContractLines = [];
+      try {
+        const { created, failed } = await tryStep('batch-create-contract-line-items', () =>
+          batchCreateObjects(hs, 'line_items', contractLineInputs.map((input) => input.properties))
+        );
+        createdContractLines = created;
+        if (failed.length) {
+          for (const fail of failed.slice(0, 3)) {
+            contractLineItemErrors.push(fail?.message || JSON.stringify(fail).slice(0, 200));
+          }
+        }
+      } catch (lineCreateErr) {
+        contractLineItemErrors.push(parseHubSpotErrorMessage(lineCreateErr));
+      }
+
+      if (createdContractLines.length) {
+        try {
+          await tryStep('batch-associate-contract-line-items', () =>
+            batchAssociateDefault(
+              hs,
+              'line_items',
+              contractTypeId,
+              createdContractLines.map((line) => [line.id, contract.id])
+            )
+          );
+          contractLineItemsCopied = createdContractLines.length;
+        } catch (assocErr) {
+          contractLineItemErrors.push(
+            `Contract line item associations failed: ${parseHubSpotErrorMessage(assocErr)}`
+          );
+        }
+      }
+
+      if (contractLineItemErrors.length) {
+        for (const msg of contractLineItemErrors.slice(0, 2)) {
+          segmentErrors.push(`contract-line-items: ${msg}`);
+        }
+      }
+
+      console.log(
+        `[copy-line-items] Copied ${contractLineItemsCopied}/${lineItems.length} line items to contract ${contract.id}`
       );
     }
 
@@ -1035,19 +1279,29 @@ exports.main = async (event, callback) => {
               }
             }
 
+            // Stamp every seeded renewal line item with the new term's start
+            // / end dates. Keeps the renewal deal's recurring lines in lock
+            // step with the deal-level contract_start_date / contract_end_date
+            // so finance never sees a renewal line missing its span.
+            const renewalLineStart = fmtDateForHS(nextStart);
+            const renewalLineEnd = fmtDateForHS(nextEnd);
+
             const renewalLineInputs = [];
             for (const item of grouped.values()) {
               const quantity = Math.max(1, Math.round(item.quantity || 0));
               const unitPrice = quantity > 0 ? item.amount / quantity : item.amount;
+              const lineProperties = {
+                name: item.name,
+                quantity: String(quantity),
+                price: (Math.round(unitPrice * 100) / 100).toFixed(2),
+                hs_sku: item.sku || '',
+                hs_recurring_billing_period: item.period || 'P12M',
+                revenue_type: item.hasExpansion ? 'expansion' : 'renewal',
+              };
+              if (renewalLineStart) lineProperties.hs_recurring_billing_start_date = renewalLineStart;
+              if (renewalLineEnd) lineProperties.hs_recurring_billing_end_date = renewalLineEnd;
               renewalLineInputs.push({
-                properties: {
-                  name: item.name,
-                  quantity: String(quantity),
-                  price: (Math.round(unitPrice * 100) / 100).toFixed(2),
-                  hs_sku: item.sku || '',
-                  hs_recurring_billing_period: item.period || 'P12M',
-                  revenue_type: item.hasExpansion ? 'expansion' : 'renewal',
-                },
+                properties: lineProperties,
                 associations: [
                   {
                     to: { id: String(renewalDeal.id) },
@@ -1106,6 +1360,7 @@ exports.main = async (event, callback) => {
         renewalDealId,
         renewalDealClosedate,
         renewalLineItemsSeeded,
+        contractLineItemsCopied,
         errorMessage: segmentErrors.length ? segmentErrors.slice(0, 3).join(' | ') : '',
       },
     });
@@ -1135,6 +1390,7 @@ exports.main = async (event, callback) => {
         renewalDealId: '',
         renewalDealClosedate: '',
         renewalLineItemsSeeded: 0,
+        contractLineItemsCopied: 0,
         errorMessage: safeMessage,
       },
     });
