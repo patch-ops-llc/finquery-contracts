@@ -1,0 +1,2 @@
+# Copy to `.dev.vars` for `wrangler dev`. Do NOT commit `.dev.vars`.
+HUBSPOT_ACCESS_TOKEN=pat-na1-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx

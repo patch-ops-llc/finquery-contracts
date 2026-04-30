@@ -1,0 +1,14 @@
+{
+  "name": "finquery-dealhub-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker that exposes a read-only DealHub-facing API for FinQuery contracts and subscription segments.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^3.90.0"
+  }
+}

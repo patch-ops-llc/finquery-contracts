@@ -1,0 +1,27 @@
+{
+  // Cloudflare Worker config for the DealHub-facing FinQuery contracts API.
+  // Deploy with `npx wrangler deploy` from this directory once secrets are set.
+  "name": "finquery-dealhub-api",
+  "main": "worker.js",
+  "compatibility_date": "2025-01-01",
+
+  // Secrets (set via `npx wrangler secret put <NAME>`):
+  //   HUBSPOT_ACCESS_TOKEN  - Private App token with crm.objects.* read scopes
+  //                           on deals, line items, fq_contract, fq_subscription
+  //
+  // The worker itself is unauthenticated — it's a demo / reference endpoint
+  // for the DealHub kickoff. DealHub queries HubSpot directly in production;
+  // they don't proxy through this worker.
+  //
+  // Public vars (safe to commit). Override here per environment if needed.
+  "vars": {
+    "ALLOWED_ORIGINS": "*"
+  },
+
+  // Optional: route a custom domain (e.g. https://dealhub-api.finquery.com)
+  // "routes": [{ "pattern": "dealhub-api.finquery.com", "custom_domain": true }],
+
+  "observability": {
+    "enabled": true
+  }
+}
