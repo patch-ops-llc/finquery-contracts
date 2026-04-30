@@ -30,8 +30,9 @@
  *    - oneTimeLineItems (number)
  *    - totalArr (number)
  *    - status (string)
- *    - renewalDealId (string)         — populated for new_business / renewal closes
- *    - renewalDealClosedate (string)  — YYYY-MM-DD; matches the new contract's end date
+ *    - renewalDealId (string)             — populated for new_business / renewal closes
+ *    - renewalDealClosedate (string)      — YYYY-MM-DD; matches the new contract's end date
+ *    - renewalLineItemsSeeded (number)    — # of line items copied onto the renewal deal
  *    - errorMessage (string)
  */
 const axios = require('axios');
@@ -57,8 +58,21 @@ const LINE_ITEM_PROPS = [
   'hs_recurring_billing_period',
   'hs_recurring_billing_start_date',
   'hs_recurring_billing_number_of_payments',
+  'hs_recurring_billing_terms',
+  'recurringbillingfrequency',
+  'hs_acv',
+  'hs_arr',
+  'hs_mrr',
+  'hs_term_in_months',
   'revenue_type',
 ];
+
+// Common one-time charges. DealHub-managed line items often don't carry
+// hs_recurring_billing_period, so when no explicit recurring signal is set we
+// assume SaaS-default (recurring) and flip to one-time only when the line
+// item name matches a setup / onboarding / training / fee pattern.
+const ONE_TIME_NAME_PATTERN =
+  /\b(setup|set[\s-]?up|onboarding|on[\s-]?boarding|implementation|installation|kick[\s-]?off|training|provisioning|one[\s-]?time|ad[\s-]?hoc|professional services)\b/i;
 
 // Minimum contract properties this workflow needs to write. We self-heal any
 // missing ones on the contract schema before creating the record so the
@@ -183,8 +197,31 @@ function getLineItemAnnualArr(lineItem) {
 }
 
 function isRecurringLineItem(lineItem) {
-  const period = String(lineItem?.properties?.hs_recurring_billing_period || '').toLowerCase();
-  return Boolean(period) && period !== 'one_time' && period !== 'onetime';
+  const props = lineItem?.properties || {};
+
+  // Hard one-time signal — explicit period of "one_time"/"onetime" wins.
+  const period = String(props.hs_recurring_billing_period || '').trim().toLowerCase();
+  if (period === 'one_time' || period === 'onetime') return false;
+  const legacyFreq = String(props.recurringbillingfrequency || '').trim().toLowerCase();
+  if (legacyFreq === 'one_time' || legacyFreq === 'onetime') return false;
+
+  // Strong recurring signals.
+  if (period && period !== 'one_time' && period !== 'onetime') return true;
+  if (legacyFreq && legacyFreq !== 'one_time' && legacyFreq !== 'onetime') return true;
+  if (Number(props.hs_arr || 0) > 0) return true;
+  if (Number(props.hs_mrr || 0) > 0) return true;
+  if (Number(props.hs_acv || 0) > 0) return true;
+  if (String(props.hs_recurring_billing_terms || '').trim()) return true;
+  if (Number(props.hs_term_in_months || 0) > 0) return true;
+
+  // No explicit recurring metadata. DealHub-managed line items rarely populate
+  // hs_recurring_billing_period, so we default to RECURRING for SaaS contexts
+  // and flip to one-time only for items whose name matches a known one-time
+  // charge pattern (setup, onboarding, training, etc.).
+  const name = String(props.name || '');
+  if (ONE_TIME_NAME_PATTERN.test(name)) return false;
+
+  return true;
 }
 
 function deriveProductCode(lineItem) {
@@ -219,6 +256,20 @@ async function createObject(hs, typeId, properties) {
   return data;
 }
 
+// Recurring billing periods we care about when seeding renewal line items.
+// We treat anything explicitly recurring (or implicitly recurring per
+// isRecurringLineItem) as eligible. One-time charges are never inherited
+// onto the next-cycle renewal deal because they live on the source contract
+// as line items only.
+function dealLineItemRenewalPeriod(lineItem) {
+  const props = lineItem?.properties || {};
+  const period = String(props.hs_recurring_billing_period || '').trim();
+  if (period && !/^one[_-]?time$/i.test(period)) return period;
+  if (period && /^one[_-]?time$/i.test(period)) return null;
+  // Default cadence when the source line item does not specify one.
+  return 'P12M';
+}
+
 async function getAssociatedIds(hs, fromType, fromId, toType) {
   try {
     const { data } = await hs.get(`/crm/v4/objects/${fromType}/${fromId}/associations/${toType}`);
@@ -237,7 +288,20 @@ function parseHubSpotErrorMessage(err) {
   const responseData = err?.response?.data;
   if (!responseData) return err?.message || 'Unknown HubSpot error';
   if (typeof responseData === 'string') return responseData;
-  if (responseData.message) return responseData.message;
+  if (responseData.message) {
+    const extras = [];
+    if (Array.isArray(responseData.errors) && responseData.errors.length) {
+      const firstThree = responseData.errors.slice(0, 3).map((e) => {
+        if (!e) return '';
+        if (typeof e === 'string') return e;
+        return e.message || e.error || JSON.stringify(e);
+      }).filter(Boolean);
+      if (firstThree.length) extras.push(`errors=[${firstThree.join('; ')}]`);
+    }
+    if (responseData.correlationId) extras.push(`correlationId=${responseData.correlationId}`);
+    if (responseData.category) extras.push(`category=${responseData.category}`);
+    return extras.length ? `${responseData.message} (${extras.join(', ')})` : responseData.message;
+  }
   try {
     return JSON.stringify(responseData);
   } catch (jsonErr) {
@@ -245,11 +309,42 @@ function parseHubSpotErrorMessage(err) {
   }
 }
 
+function buildHubSpotErrorMessage(err, context) {
+  if (!err) return context || 'Unknown error';
+  const status = err?.response?.status;
+  const url = err?.config?.url;
+  const method = String(err?.config?.method || '').toUpperCase();
+  const detail = parseHubSpotErrorMessage(err);
+  const parts = [];
+  if (context) parts.push(context);
+  if (status) parts.push(`HTTP ${status}`);
+  if (method && url) parts.push(`${method} ${url}`);
+  if (detail) parts.push(detail);
+  if (!status && err?.code) parts.push(`code=${err.code}`);
+  return parts.join(' | ');
+}
+
+async function tryStep(label, fn) {
+  try {
+    return await fn();
+  } catch (err) {
+    if (err && !err.__step) {
+      try { Object.defineProperty(err, '__step', { value: label, enumerable: false }); }
+      catch (_) { err.__step = label; }
+    }
+    throw err;
+  }
+}
+
 async function createObjectWithFallback(hs, typeId, properties, requiredKeys) {
   try {
     return await createObject(hs, typeId, properties);
   } catch (err) {
-    if (err?.response?.status !== 400 && err?.response?.status !== 422) throw err;
+    const status = err?.response?.status;
+    const firstMessage = parseHubSpotErrorMessage(err);
+    if (status !== 400 && status !== 422) {
+      throw new Error(`Object create failed (typeId=${typeId}, status=${status || 'n/a'}). ${firstMessage}`);
+    }
 
     const fallback = {};
     for (const key of requiredKeys) {
@@ -258,14 +353,15 @@ async function createObjectWithFallback(hs, typeId, properties, requiredKeys) {
       }
     }
 
-    if (!Object.keys(fallback).length) throw err;
+    if (!Object.keys(fallback).length) {
+      throw new Error(`Object create failed (typeId=${typeId}, no fallback keys available). ${firstMessage}`);
+    }
 
     try {
       return await createObject(hs, typeId, fallback);
     } catch (fallbackErr) {
-      const first = parseHubSpotErrorMessage(err);
       const second = parseHubSpotErrorMessage(fallbackErr);
-      throw new Error(`Object create failed (full + fallback payload). ${first} | ${second}`);
+      throw new Error(`Object create failed (typeId=${typeId}). full=${firstMessage} | fallback=${second}`);
     }
   }
 }
@@ -281,7 +377,7 @@ async function associateWithFallback(hs, fromType, fromId, toType, toId) {
     } catch (secondErr) {
       const first = parseHubSpotErrorMessage(firstErr);
       const second = parseHubSpotErrorMessage(secondErr);
-      throw new Error(`Association failed both directions. ${first} | ${second}`);
+      throw new Error(`Association failed both directions (${fromType}:${fromId} <-> ${toType}:${toId}). forward=${first} | reverse=${second}`);
     }
   }
 }
@@ -297,6 +393,106 @@ async function getSchemaPropertyNamesByTypeId(hs, typeId) {
   return new Set((data.properties || []).map((p) => p.name));
 }
 
+// Fetches /crm/v3/schemas exactly once and returns both type IDs and property
+// name sets for the requested schemas. Saves 3 round-trips vs. calling
+// getTypeIdBySchemaName + getSchemaPropertyNamesByTypeId individually for each
+// schema -- crucial for staying inside the 20s workflow wall clock.
+async function loadSchemasIndex(hs, schemaNames) {
+  const { data } = await hs.get('/crm/v3/schemas');
+  const all = data?.results || [];
+  const out = {};
+  for (const name of schemaNames) {
+    const schema = all.find((s) => s.name === name);
+    if (!schema) {
+      out[name] = { typeId: null, propertyNames: new Set() };
+      continue;
+    }
+    out[name] = {
+      typeId: schema.objectTypeId,
+      propertyNames: new Set((schema.properties || []).map((p) => p.name)),
+    };
+  }
+  return out;
+}
+
+// Batch read up to 100 records per call.
+async function batchReadObjects(hs, typeId, ids, properties) {
+  if (!ids?.length) return [];
+  const all = [];
+  for (let i = 0; i < ids.length; i += 100) {
+    const slice = ids.slice(i, i + 100);
+    const { data } = await hs.post(`/crm/v3/objects/${typeId}/batch/read`, {
+      properties,
+      inputs: slice.map((id) => ({ id: String(id) })),
+    });
+    all.push(...(data?.results || []));
+  }
+  return all;
+}
+
+// Batch create up to 100 records per call. Returns the same shape per item as
+// the single-create endpoint (id + properties). Order is preserved.
+async function batchCreateObjects(hs, typeId, items) {
+  if (!items?.length) return { created: [], failed: [] };
+  const created = [];
+  const failed = [];
+  for (let i = 0; i < items.length; i += 100) {
+    const slice = items.slice(i, i + 100);
+    try {
+      const resp = await hs.post(`/crm/v3/objects/${typeId}/batch/create`, {
+        inputs: slice.map((properties) => ({ properties })),
+      });
+      const results = resp?.data?.results || [];
+      created.push(...results);
+      // 207 multi-status surfaces an `errors` array when some inputs failed.
+      const partialErrors = resp?.data?.errors;
+      if (Array.isArray(partialErrors) && partialErrors.length) {
+        failed.push(...partialErrors);
+      }
+    } catch (err) {
+      const status = err?.response?.status;
+      const message = parseHubSpotErrorMessage(err);
+      throw new Error(`Batch create failed (typeId=${typeId}, batch=${i}-${i + slice.length}, status=${status || 'n/a'}). ${message}`);
+    }
+  }
+  return { created, failed };
+}
+
+// Batch associate using the v4 default-label endpoint. If the endpoint isn't
+// available for the type pair we fall back to sequential PUTs.
+async function batchAssociateDefault(hs, fromType, toType, pairs) {
+  if (!pairs?.length) return { ok: 0, failed: 0 };
+  let ok = 0;
+  let failed = 0;
+  for (let i = 0; i < pairs.length; i += 100) {
+    const slice = pairs.slice(i, i + 100);
+    try {
+      await hs.post(`/crm/v4/associations/${fromType}/${toType}/batch/associate/default`, {
+        inputs: slice.map(([from, to]) => ({ from: { id: String(from) }, to: { id: String(to) } })),
+      });
+      ok += slice.length;
+    } catch (err) {
+      const status = err?.response?.status;
+      const message = parseHubSpotErrorMessage(err);
+      console.warn(
+        `[batch-associate] ${fromType} -> ${toType} batch failed (status=${status || 'n/a'}): ${message}. Falling back to sequential.`
+      );
+      for (const [from, to] of slice) {
+        try {
+          await associateWithFallback(hs, fromType, from, toType, to);
+          ok += 1;
+        } catch (perItemErr) {
+          failed += 1;
+          console.warn(
+            `[batch-associate] sequential fallback failed for ${fromType}:${from} -> ${toType}:${to}: ${perItemErr.message}`
+          );
+        }
+      }
+    }
+  }
+  return { ok, failed };
+}
+
 function filterPropertiesForSchema(properties, schemaPropertyNames) {
   const filtered = {};
   for (const [key, value] of Object.entries(properties || {})) {
@@ -307,12 +503,38 @@ function filterPropertiesForSchema(properties, schemaPropertyNames) {
   return filtered;
 }
 
+async function getDefaultPropertyGroupName(hs, typeId) {
+  try {
+    const { data } = await hs.get(`/crm/v3/properties/${typeId}/groups`);
+    const groups = data?.results || [];
+    if (!groups.length) return null;
+    const nonHubspot = groups.find(
+      (g) => g?.name && !String(g.name).toLowerCase().startsWith('hs_')
+    );
+    return (nonHubspot || groups[0])?.name || null;
+  } catch (err) {
+    console.warn(`[ensure-properties] Could not fetch groups for ${typeId}: ${parseHubSpotErrorMessage(err)}`);
+    return null;
+  }
+}
+
 async function ensureSchemaProperties(hs, typeId, expectedProperties, existingPropertyNames) {
+  const missing = expectedProperties.filter((prop) => !existingPropertyNames.has(prop.name));
+  if (!missing.length) return [];
+
+  const defaultGroup = await getDefaultPropertyGroupName(hs, typeId);
   const created = [];
-  for (const prop of expectedProperties) {
-    if (existingPropertyNames.has(prop.name)) continue;
+
+  for (const prop of missing) {
+    const payload = prop.groupName ? prop : { ...prop, groupName: defaultGroup || prop.groupName };
+    if (!payload.groupName) {
+      console.warn(
+        `[ensure-properties] Skipping ${prop.name} on ${typeId}: no property group available`
+      );
+      continue;
+    }
     try {
-      await hs.post(`/crm/v3/properties/${typeId}`, prop);
+      await hs.post(`/crm/v3/properties/${typeId}`, payload);
       existingPropertyNames.add(prop.name);
       created.push(prop.name);
       console.log(`[ensure-properties] Created missing property ${prop.name} on ${typeId}`);
@@ -359,17 +581,20 @@ exports.main = async (event, callback) => {
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
       },
-      timeout: 20000,
+      // Per-call timeout MUST be well under the 20s workflow wall clock so a
+      // single hung request can't burn the entire budget.
+      timeout: 8000,
     });
 
     // HubSpot Private Apps cap at 100 req / 10 sec. Without retry/backoff a
-    // single closed-deal burst (segment + association calls) trips a 429 and
-    // surfaces as "Request failed with status code 429". Retry 429 / 5xx with
-    // exponential backoff + jitter, honoring `Retry-After`. Workflow custom
-    // code actions have a ~20s wall clock so we keep the budget tight.
-    const HS_MAX_RETRIES = 4;
-    const HS_BASE_DELAY_MS = 400;
-    const HS_MAX_DELAY_MS = 4000;
+    // single closed-deal burst trips a 429 and surfaces as "Request failed
+    // with status code 429". Retry 429 / 5xx with exponential backoff +
+    // jitter, honoring `Retry-After`. Workflow custom code actions have a
+    // ~20s wall clock so we keep the budget very tight: max 2 retries with a
+    // 1.5s ceiling, capping worst-case backoff at ~3s.
+    const HS_MAX_RETRIES = 2;
+    const HS_BASE_DELAY_MS = 300;
+    const HS_MAX_DELAY_MS = 1500;
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
     const shouldRetry = (err) => {
       const status = err?.response?.status;
@@ -414,38 +639,50 @@ exports.main = async (event, callback) => {
       }
     );
 
-    const [contractTypeId, subscriptionTypeId] = await Promise.all([
-      getTypeIdBySchemaName(hs, 'fq_contract'),
-      getTypeIdBySchemaName(hs, 'fq_subscription'),
-    ]);
+    // Single /crm/v3/schemas call returns BOTH type IDs and property name
+    // sets for both schemas. Saves 3 sequential round-trips vs. lookup +
+    // per-schema property fetches.
+    const schemaIndex = await tryStep('lookup-schemas', () =>
+      loadSchemasIndex(hs, ['fq_contract', 'fq_subscription'])
+    );
+    const contractTypeId = schemaIndex.fq_contract.typeId;
+    const subscriptionTypeId = schemaIndex.fq_subscription.typeId;
+    const contractSchemaPropertyNames = schemaIndex.fq_contract.propertyNames;
+    const subscriptionSchemaPropertyNames = schemaIndex.fq_subscription.propertyNames;
 
     if (!contractTypeId) throw new Error('Could not find schema fq_contract.');
     if (!subscriptionTypeId) throw new Error('Could not find schema fq_subscription.');
 
-    const [contractSchemaPropertyNames, subscriptionSchemaPropertyNames] = await Promise.all([
-      getSchemaPropertyNamesByTypeId(hs, contractTypeId),
-      getSchemaPropertyNamesByTypeId(hs, subscriptionTypeId),
-    ]);
-
     // Self-heal any contract properties this workflow needs but the live
-    // schema is missing (e.g. older portals where start_date / end_date were
-    // never created on fq_contract).
-    await ensureSchemaProperties(
-      hs,
-      contractTypeId,
-      CONTRACT_REQUIRED_PROPERTIES,
-      contractSchemaPropertyNames
+    // schema is missing. ensureSchemaProperties is a no-op when nothing is
+    // missing (which is the normal case after first run).
+    await tryStep('ensure-contract-properties', () =>
+      ensureSchemaProperties(
+        hs,
+        contractTypeId,
+        CONTRACT_REQUIRED_PROPERTIES,
+        contractSchemaPropertyNames
+      )
     );
 
-    const deal = await getObject(hs, '0-3', dealId, DEAL_PROPS);
+    // Pull the deal record + its 3 association lists in parallel so the
+    // setup phase costs ~1 round-trip instead of 4 sequential ones.
+    const [deal, companyIds, contactIds, lineItemIds] = await tryStep(
+      `fetch-deal-context:${dealId}`,
+      () =>
+        Promise.all([
+          getObject(hs, '0-3', dealId, DEAL_PROPS),
+          getAssociatedIds(hs, '0-3', dealId, '0-2'),
+          getAssociatedIds(hs, '0-3', dealId, '0-1'),
+          getAssociatedIds(hs, '0-3', dealId, 'line_items'),
+        ])
+    );
     const dealProps = deal.properties || {};
 
-    const companyIds = await getAssociatedIds(hs, '0-3', dealId, '0-2');
-    const contactIds = await getAssociatedIds(hs, '0-3', dealId, '0-1');
-    const lineItemIds = await getAssociatedIds(hs, '0-3', dealId, 'line_items');
-
     const lineItems = lineItemIds.length
-      ? await Promise.all(lineItemIds.map((id) => getObject(hs, 'line_items', id, LINE_ITEM_PROPS)))
+      ? await tryStep('batch-read-line-items', () =>
+          batchReadObjects(hs, 'line_items', lineItemIds, LINE_ITEM_PROPS)
+        )
       : [];
 
     const lineItemsProcessed = lineItems.length;
@@ -484,29 +721,29 @@ exports.main = async (event, callback) => {
     const contractRequiredKeys = ['contract_name', 'status', 'contract_data'].filter((key) =>
       contractSchemaPropertyNames.has(key)
     );
-    const contract = await createObjectWithFallback(
-      hs,
-      contractTypeId,
-      contractPayload,
-      contractRequiredKeys
+    const contract = await tryStep('create-contract', () =>
+      createObjectWithFallback(hs, contractTypeId, contractPayload, contractRequiredKeys)
     );
 
-    await associateWithFallback(hs, contractTypeId, contract.id, '0-3', dealId);
+    // Run all post-create contract associations in parallel. Contacts are
+    // batched into a single API call instead of looping with a PUT each.
+    await tryStep(`associate-contract-context:${contract.id}`, () =>
+      Promise.all([
+        associateWithFallback(hs, contractTypeId, contract.id, '0-3', dealId),
+        companyIds[0]
+          ? associateWithFallback(hs, contractTypeId, contract.id, '0-2', companyIds[0])
+          : Promise.resolve(),
+        contactIds.length
+          ? batchAssociateDefault(
+              hs,
+              contractTypeId,
+              '0-1',
+              contactIds.map((cid) => [contract.id, cid])
+            )
+          : Promise.resolve(),
+      ])
+    );
 
-    if (companyIds[0]) {
-      await associateWithFallback(hs, contractTypeId, contract.id, '0-2', companyIds[0]);
-    }
-
-    for (const contactId of contactIds) {
-      try {
-        await associateWithFallback(hs, contractTypeId, contract.id, '0-1', contactId);
-      } catch (err) {
-        // Best effort: avoid failing action on single bad contact association.
-        console.warn(`Contact association failed for ${contactId}: ${err.message}`);
-      }
-    }
-
-    let createdSegments = 0;
     let totalArr = 0;
     const segmentErrors = [];
     const yearSegments = buildYearSegments(derivedStartDate, derivedEndDate);
@@ -518,6 +755,12 @@ exports.main = async (event, callback) => {
     const cleanedContractName = cleanContractName(dealProps.dealname);
     const dealRevenueType = normalizeRevenueType('', category === 'renewal' ? 'renewal' : 'new');
 
+    // Build all segment payloads in one pass so we can batch-create them.
+    // Order matters here -- the response from /batch/create preserves input
+    // order so we can use `created[i]` to associate the same segment that
+    // came from `segmentPayloads[i]`.
+    const segmentPayloads = [];
+    const segmentLabels = [];
     for (const [liIndex, lineItem] of recurringLineItems.entries()) {
       const lp = lineItem.properties || {};
       const productName = String(lp.name || 'Product').trim() || 'Product';
@@ -556,48 +799,109 @@ exports.main = async (event, callback) => {
           revenue_type: lineRevenueType,
         };
 
-        const segmentPayload = filterPropertiesForSchema(segmentPayloadRaw, subscriptionSchemaPropertyNames);
-        const segmentRequiredKeys = [
-          'segment_name',
-          'product_name',
-          'product_code',
-          'quantity',
-          'unit_price',
-          'arr',
-          'mrr',
-          'tcv',
-          'status',
-          'start_date',
-          'end_date',
-          'revenue_type',
-        ].filter((key) => subscriptionSchemaPropertyNames.has(key));
+        segmentPayloads.push(filterPropertiesForSchema(segmentPayloadRaw, subscriptionSchemaPropertyNames));
+        segmentLabels.push(`${productName} Year ${segmentYear.year}`);
+      }
+    }
 
-        try {
-          const segment = await createObjectWithFallback(
-            hs,
-            subscriptionTypeId,
-            segmentPayload,
-            segmentRequiredKeys
-          );
+    // Batch-create all segments in a single call (or two if >100). If the
+    // batch fails outright with a 400/422 (typically a property validation
+    // issue affecting every payload), retry once with a required-keys-only
+    // fallback so we still write the data.
+    let createdSegmentsList = [];
+    let segmentBatchFailures = [];
+    if (segmentPayloads.length) {
+      const segmentRequiredKeys = [
+        'segment_name',
+        'product_name',
+        'product_code',
+        'quantity',
+        'unit_price',
+        'arr',
+        'mrr',
+        'tcv',
+        'status',
+        'start_date',
+        'end_date',
+        'revenue_type',
+      ].filter((key) => subscriptionSchemaPropertyNames.has(key));
 
-          await associateWithFallback(hs, subscriptionTypeId, segment.id, contractTypeId, contract.id);
-
-          if (companyIds[0]) {
-            try {
-              await associateWithFallback(hs, subscriptionTypeId, segment.id, '0-2', companyIds[0]);
-            } catch (err) {
-              console.warn(`Company association failed for segment ${segment.id}: ${err.message}`);
+      try {
+        const { created, failed } = await tryStep('batch-create-segments', () =>
+          batchCreateObjects(hs, subscriptionTypeId, segmentPayloads)
+        );
+        createdSegmentsList = created;
+        segmentBatchFailures = failed;
+      } catch (batchErr) {
+        const messageFromAxios = parseHubSpotErrorMessage(batchErr);
+        console.warn(`[batch-create-segments] full payload batch failed: ${messageFromAxios}. Retrying with required-keys-only fallback.`);
+        const reducedPayloads = segmentPayloads.map((payload) => {
+          const reduced = {};
+          for (const key of segmentRequiredKeys) {
+            if (payload[key] !== undefined && payload[key] !== null && payload[key] !== '') {
+              reduced[key] = payload[key];
             }
           }
-
-          createdSegments += 1;
-        } catch (segmentErr) {
-          const segmentErrorMessage = parseHubSpotErrorMessage(segmentErr);
-          const label = `${productName} Year ${segmentYear.year}`;
-          segmentErrors.push(`${label}: ${segmentErrorMessage}`);
-          console.warn(`Segment creation failed for ${label}: ${segmentErrorMessage}`);
+          return reduced;
+        });
+        try {
+          const { created, failed } = await tryStep('batch-create-segments-fallback', () =>
+            batchCreateObjects(hs, subscriptionTypeId, reducedPayloads)
+          );
+          createdSegmentsList = created;
+          segmentBatchFailures = failed;
+        } catch (fallbackErr) {
+          const fallbackMessage = parseHubSpotErrorMessage(fallbackErr);
+          segmentErrors.push(`Batch create failed (full + fallback). full=${messageFromAxios} | fallback=${fallbackMessage}`);
         }
       }
+
+      if (segmentBatchFailures.length) {
+        for (const item of segmentBatchFailures.slice(0, 5)) {
+          segmentErrors.push(item?.message || JSON.stringify(item).slice(0, 200));
+        }
+      }
+    }
+
+    const createdSegments = createdSegmentsList.length;
+
+    // Batch-associate every created segment to the contract (and to the
+    // company if present). One call per from->to type pair regardless of
+    // segment count.
+    if (createdSegments) {
+      try {
+        await tryStep('batch-associate-segments-to-contract', () =>
+          batchAssociateDefault(
+            hs,
+            subscriptionTypeId,
+            contractTypeId,
+            createdSegmentsList.map((seg) => [seg.id, contract.id])
+          )
+        );
+      } catch (assocErr) {
+        segmentErrors.push(`Segment->contract associations failed: ${parseHubSpotErrorMessage(assocErr)}`);
+      }
+
+      if (companyIds[0]) {
+        try {
+          await tryStep('batch-associate-segments-to-company', () =>
+            batchAssociateDefault(
+              hs,
+              subscriptionTypeId,
+              '0-2',
+              createdSegmentsList.map((seg) => [seg.id, companyIds[0]])
+            )
+          );
+        } catch (assocErr) {
+          segmentErrors.push(`Segment->company associations failed: ${parseHubSpotErrorMessage(assocErr)}`);
+        }
+      }
+    }
+
+    if (segmentLabels.length && createdSegments < segmentLabels.length) {
+      console.warn(
+        `Only ${createdSegments}/${segmentLabels.length} segments were created. First missing: ${segmentLabels[createdSegments]}`
+      );
     }
 
     const rollupPayload = filterPropertiesForSchema(
@@ -626,78 +930,162 @@ exports.main = async (event, callback) => {
     // never spawn renewal deals from this workflow.
     let renewalDealId = '';
     let renewalDealClosedate = '';
+    let renewalLineItemsSeeded = 0;
     const renewalEligibleCategories = ['new_business', 'renewal'];
     if (renewalEligibleCategories.includes(category)) {
       try {
-        // Skip if an open renewal deal already exists on this contract.
-        const existingDealIds = await getAssociatedIds(hs, contractTypeId, contract.id, '0-3');
-        let openRenewalExists = false;
-        for (const did of existingDealIds.slice(0, 25)) {
-          try {
-            const existingDeal = await getObject(hs, '0-3', did, ['dealstage', 'deal_category']);
-            const stage = String(existingDeal?.properties?.dealstage || '').toLowerCase();
-            const cat = String(existingDeal?.properties?.deal_category || '').toLowerCase();
-            if (cat === 'renewal' && stage !== 'closedwon' && stage !== 'closedlost') {
-              openRenewalExists = true;
-              break;
+        // We just created this contract -- the only deal on it is the source
+        // deal that triggered this workflow, so there cannot be an existing
+        // open renewal deal. Skip the peek that previously cost N+1
+        // sequential round-trips.
+        const nextStart = parseDateValue(derivedEndDate) || new Date();
+        nextStart.setUTCDate(nextStart.getUTCDate() + 1);
+        const nextEnd = new Date(nextStart);
+        nextEnd.setUTCFullYear(nextEnd.getUTCFullYear() + 1);
+        renewalDealClosedate = derivedEndDate;
+
+        const renewalDealName = `${cleanedContractName} — Renewal`;
+        const renewalDeal = await createObject(hs, '0-3', {
+          dealname: renewalDealName,
+          dealstage: 'appointmentscheduled',
+          deal_category: 'renewal',
+          contract_start_date: fmtDateForHS(nextStart),
+          contract_end_date: fmtDateForHS(nextEnd),
+          closedate: derivedEndDate,
+          amount: String(totalArr || 0),
+          pipeline: 'default',
+        });
+        renewalDealId = String(renewalDeal.id);
+
+        // Wire up the renewal deal to the contract, company, and contacts in
+        // parallel. Each handler swallows its own error so a single bad
+        // association cannot prevent the others from completing.
+        await Promise.all([
+          associateWithFallback(hs, contractTypeId, contract.id, '0-3', renewalDeal.id).catch((err) => {
+            console.warn(`Renewal deal -> contract association failed: ${err.message}`);
+          }),
+          companyIds[0]
+            ? associateWithFallback(hs, '0-3', renewalDeal.id, '0-2', companyIds[0]).catch((err) => {
+                console.warn(`Renewal deal company association failed: ${err.message}`);
+              })
+            : Promise.resolve(),
+          contactIds.length
+            ? batchAssociateDefault(
+                hs,
+                '0-3',
+                '0-1',
+                contactIds.map((cid) => [renewalDeal.id, cid])
+              ).catch((err) => {
+                console.warn(`Renewal deal contacts association failed: ${err.message}`);
+              })
+            : Promise.resolve(),
+        ]);
+
+        // Seed the renewal deal with ONE line item per recurring product from
+        // the source deal. The source deal's line items already represent
+        // this term's quantities/prices for each product, so they map 1:1 to
+        // what the renewal should carry into DealHub. We do NOT pull from
+        // the new contract's subscription segments here -- segments span
+        // every year of the term, and naively inheriting them would result
+        // in N copies of each product (one per year) on the renewal deal.
+        //
+        // Recurring filter mirrors the contract-side `isRecurringLineItem`
+        // logic so one-time / setup / training charges never leak onto the
+        // next-cycle renewal.
+        try {
+          const recurringForRenewal = lineItems.filter(isRecurringLineItem);
+          if (!recurringForRenewal.length) {
+            console.log(
+              `Renewal deal ${renewalDeal.id}: no recurring line items on source deal — leaving renewal deal empty.`
+            );
+          } else {
+            // Dedup by product (sku preferred, fall back to name) so a single
+            // product split across multiple source line items still becomes a
+            // single line on the renewal deal with summed quantity + amount.
+            const grouped = new Map();
+            for (const li of recurringForRenewal) {
+              const lp = li.properties || {};
+              const sku = String(lp.hs_sku || '').trim();
+              const name = String(lp.name || 'Product').trim() || 'Product';
+              const key = (sku || name).toLowerCase();
+              const qty = Math.max(0, Number(lp.quantity) || 0) || 1;
+              const unitPrice = Math.max(0, Number(lp.price) || 0);
+              const lineAmount = qty * unitPrice;
+              const period = dealLineItemRenewalPeriod(li) || 'P12M';
+
+              if (!grouped.has(key)) {
+                grouped.set(key, {
+                  name,
+                  sku,
+                  quantity: 0,
+                  amount: 0,
+                  period,
+                  hasExpansion: false,
+                });
+              }
+              const g = grouped.get(key);
+              g.quantity += qty;
+              g.amount += lineAmount;
+              if (!g.sku && sku) g.sku = sku;
+              if (period) g.period = period;
+
+              const lineRevenue = String(lp.revenue_type || '').toLowerCase().trim();
+              if (lineRevenue === 'expansion' || lineRevenue === 'cross_sell' || lineRevenue === 'new') {
+                g.hasExpansion = true;
+              }
             }
-          } catch (peekErr) {
-            // Best-effort: if a single deal lookup fails, keep scanning.
+
+            const renewalLineInputs = [];
+            for (const item of grouped.values()) {
+              const quantity = Math.max(1, Math.round(item.quantity || 0));
+              const unitPrice = quantity > 0 ? item.amount / quantity : item.amount;
+              renewalLineInputs.push({
+                properties: {
+                  name: item.name,
+                  quantity: String(quantity),
+                  price: (Math.round(unitPrice * 100) / 100).toFixed(2),
+                  hs_sku: item.sku || '',
+                  hs_recurring_billing_period: item.period || 'P12M',
+                  revenue_type: item.hasExpansion ? 'expansion' : 'renewal',
+                },
+                associations: [
+                  {
+                    to: { id: String(renewalDeal.id) },
+                    types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 20 }],
+                  },
+                ],
+              });
+            }
+
+            try {
+              const { data: liResp } = await hs.post('/crm/v3/objects/line_items/batch/create', {
+                inputs: renewalLineInputs,
+              });
+              renewalLineItemsSeeded = (liResp?.results || []).length;
+              console.log(
+                `Renewal deal ${renewalDeal.id}: seeded ${renewalLineItemsSeeded} line item(s) ` +
+                `from ${recurringForRenewal.length} source recurring line item(s) ` +
+                `(${grouped.size} distinct product${grouped.size === 1 ? '' : 's'})`
+              );
+            } catch (batchLineErr) {
+              const partial = batchLineErr?.response?.data?.results || [];
+              renewalLineItemsSeeded = partial.length;
+              console.warn(
+                `Renewal deal ${renewalDeal.id}: batch line item create failed: ${parseHubSpotErrorMessage(batchLineErr)}. ` +
+                `${renewalLineItemsSeeded} line(s) created before failure.`
+              );
+            }
           }
+        } catch (seedErr) {
+          // Line item seeding must NEVER prevent the renewal deal from existing.
+          console.warn(`Renewal deal ${renewalDeal.id} line-item seeding failed: ${seedErr.message}`);
         }
 
-        if (!openRenewalExists) {
-          // Renewal term: day after current end → +1 year. Close date is the
-          // current contract end date so the deal lands in the right
-          // forecast quarter.
-          const nextStart = parseDateValue(derivedEndDate) || new Date();
-          nextStart.setUTCDate(nextStart.getUTCDate() + 1);
-          const nextEnd = new Date(nextStart);
-          nextEnd.setUTCFullYear(nextEnd.getUTCFullYear() + 1);
-          renewalDealClosedate = derivedEndDate;
-
-          const renewalDealName = `${cleanedContractName} — Renewal`;
-          const renewalDeal = await createObject(hs, '0-3', {
-            dealname: renewalDealName,
-            dealstage: 'appointmentscheduled',
-            deal_category: 'renewal',
-            contract_start_date: fmtDateForHS(nextStart),
-            contract_end_date: fmtDateForHS(nextEnd),
-            closedate: derivedEndDate,
-            amount: String(totalArr || 0),
-            pipeline: 'default',
-          });
-          renewalDealId = String(renewalDeal.id);
-
-          // Carry the company + contacts + new contract over to the renewal
-          // deal so DealHub has the full context immediately.
-          if (companyIds[0]) {
-            try {
-              await associateWithFallback(hs, '0-3', renewalDeal.id, '0-2', companyIds[0]);
-            } catch (assocErr) {
-              console.warn(`Renewal deal company association failed: ${assocErr.message}`);
-            }
-          }
-          try {
-            await associateWithFallback(hs, contractTypeId, contract.id, '0-3', renewalDeal.id);
-          } catch (assocErr) {
-            console.warn(`Renewal deal -> contract association failed: ${assocErr.message}`);
-          }
-          for (const contactId of contactIds) {
-            try {
-              await associateWithFallback(hs, '0-3', renewalDeal.id, '0-1', contactId);
-            } catch (contactErr) {
-              // Skip invalid contacts — best-effort.
-            }
-          }
-
-          console.log(
-            `Renewal deal ${renewalDeal.id} auto-created for contract ${contract.id} ` +
-            `(${fmtDateForHS(nextStart)} → ${fmtDateForHS(nextEnd)}, closedate=${derivedEndDate})`
-          );
-        } else {
-          console.log(`Skipping renewal deal auto-creation; an open renewal already exists for contract ${contract.id}`);
-        }
+        console.log(
+          `Renewal deal ${renewalDeal.id} auto-created for contract ${contract.id} ` +
+          `(${fmtDateForHS(nextStart)} → ${fmtDateForHS(nextEnd)}, closedate=${derivedEndDate}, ` +
+          `lineItems=${renewalLineItemsSeeded})`
+        );
       } catch (renewalErr) {
         // Failing to spawn the renewal deal must NOT fail the contract creation.
         console.warn(`Renewal deal auto-creation failed: ${renewalErr.message}`);
@@ -717,11 +1105,24 @@ exports.main = async (event, callback) => {
         status: determineStatus(derivedStartDate, derivedEndDate),
         renewalDealId,
         renewalDealClosedate,
+        renewalLineItemsSeeded,
         errorMessage: segmentErrors.length ? segmentErrors.slice(0, 3).join(' | ') : '',
       },
     });
   } catch (err) {
-    console.error('Workflow action failed:', err.response?.data || err.message);
+    const step = err?.__step ? `step=${err.__step}` : null;
+    const detailedMessage = buildHubSpotErrorMessage(err, step);
+    console.error('Workflow action failed:', {
+      step: err?.__step || null,
+      message: err?.message,
+      status: err?.response?.status,
+      url: err?.config?.url,
+      method: err?.config?.method,
+      data: err?.response?.data,
+      stack: err?.stack,
+    });
+    // HubSpot workflow output fields cap below ~64 KB; trim defensively.
+    const safeMessage = (detailedMessage || 'Unknown error').slice(0, 4000);
     callback({
       outputFields: {
         success: 'false',
@@ -733,7 +1134,8 @@ exports.main = async (event, callback) => {
         status: '',
         renewalDealId: '',
         renewalDealClosedate: '',
-        errorMessage: err.message || 'Unknown error',
+        renewalLineItemsSeeded: 0,
+        errorMessage: safeMessage,
       },
     });
   }

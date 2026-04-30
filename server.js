@@ -1136,6 +1136,80 @@ async function syncContractRecurringLineItemsToDeal(contractId, dealId, options 
         }
       }
 
+      // Multi-year contracts have one segment per product per year. The renewal
+      // deal must carry ONE line item per product reflecting the current state
+      // of that product, NOT a sum of every year's quantity/price. Without this
+      // dedup, a 3-year contract for Product A produces a renewal line item
+      // with 3x the quantity and 3x the amount.
+      //
+      // Per-product preference:
+      //   1) the segment whose [arr_start_date, arr_end_date] window contains
+      //      today (the "currently active" year segment for that product)
+      //   2) the most recent past segment (latest end_date <= today)
+      //   3) the soonest future segment (earliest start_date > today)
+      //   4) any segment (last resort, when dates are missing)
+      const segmentSortKey = (sub) => {
+        const p = sub?.properties || {};
+        const startD = parseDateValue(p.arr_start_date || p.start_date);
+        const endD = parseDateValue(p.arr_end_date || p.end_date);
+        const segYearRaw = parseInt(p.segment_year, 10);
+        const segYear = Number.isFinite(segYearRaw) && segYearRaw > 0 ? segYearRaw : 0;
+        return { startD, endD, segYear };
+      };
+
+      const pickBetterSegment = (a, b) => {
+        if (!a) return b;
+        if (!b) return a;
+        const ka = segmentSortKey(a);
+        const kb = segmentSortKey(b);
+        const aIsCurrent = ka.startD && ka.endD && ka.startD <= today && ka.endD >= today;
+        const bIsCurrent = kb.startD && kb.endD && kb.startD <= today && kb.endD >= today;
+        if (aIsCurrent && !bIsCurrent) return a;
+        if (bIsCurrent && !aIsCurrent) return b;
+
+        const aIsPast = ka.endD && ka.endD < today;
+        const bIsPast = kb.endD && kb.endD < today;
+        const aIsFuture = ka.startD && ka.startD > today;
+        const bIsFuture = kb.startD && kb.startD > today;
+
+        // Past preferred over future when no current segment exists.
+        if (aIsPast && bIsFuture) return a;
+        if (bIsPast && aIsFuture) return b;
+
+        // Among past segments: latest end date wins.
+        if (aIsPast && bIsPast) {
+          return ka.endD >= kb.endD ? a : b;
+        }
+        // Among future segments: earliest start date wins.
+        if (aIsFuture && bIsFuture) {
+          return ka.startD <= kb.startD ? a : b;
+        }
+        // Fallback: highest segment_year, then latest start date.
+        if (ka.segYear !== kb.segYear) return ka.segYear > kb.segYear ? a : b;
+        if (ka.startD && kb.startD) return ka.startD >= kb.startD ? a : b;
+        return a;
+      };
+
+      const segmentsByProduct = new Map();
+      for (const sub of inheritableSubs) {
+        const p = sub?.properties || {};
+        const productKeyRaw = String(p.product_code || p.product_name || '').trim();
+        const productKey = productKeyRaw
+          ? productKeyRaw.toLowerCase()
+          : `__sub_${sub.id}`;
+        const current = segmentsByProduct.get(productKey);
+        segmentsByProduct.set(productKey, pickBetterSegment(current, sub));
+      }
+
+      const dedupedCount = inheritableSubs.length - segmentsByProduct.size;
+      if (dedupedCount > 0) {
+        console.log(
+          `[sync-contract-lines] Contract ${contractId}: deduped ${inheritableSubs.length} segments down to ` +
+          `${segmentsByProduct.size} (one per product, current/most-recent year)`
+        );
+      }
+      inheritableSubs = Array.from(segmentsByProduct.values());
+
       if (inheritableSubs.length > 0) {
         const billingFrequencyToPeriod = (billingFrequencyRaw) => {
           const value = String(billingFrequencyRaw || '').trim().toLowerCase();
