@@ -806,6 +806,38 @@ function parsePeriodMonths(period) {
   return iso[2] === 'Y' ? num * 12 : num;
 }
 
+// DealHub-managed line items frequently omit hs_recurring_billing_period,
+// so we use a multi-signal check and fall back to a name-based one-time
+// heuristic (setup / onboarding / training / etc). Default for SaaS line
+// items is RECURRING — explicit "one_time" markers or matching names flip
+// the result.
+//
+// Hoisted to module scope so /api/load-contract (which needs to surface
+// one-time implementation/onboarding line items in the UI) and
+// /api/update-contract-from-deal share a single source of truth.
+const ONE_TIME_NAME_PATTERN =
+  /\b(setup|set[\s-]?up|onboarding|on[\s-]?boarding|implementation|installation|kick[\s-]?off|training|provisioning|one[\s-]?time|ad[\s-]?hoc|professional services)\b/i;
+
+function isRecurringLineItem(li) {
+  const lp = (li && li.properties) || {};
+  const period = String(lp.hs_recurring_billing_period || '').trim().toLowerCase();
+  if (period === 'one_time' || period === 'onetime') return false;
+  const legacyFreq = String(lp.recurringbillingfrequency || '').trim().toLowerCase();
+  if (legacyFreq === 'one_time' || legacyFreq === 'onetime') return false;
+
+  if (period && period !== 'one_time' && period !== 'onetime') return true;
+  if (legacyFreq && legacyFreq !== 'one_time' && legacyFreq !== 'onetime') return true;
+  if (Number(lp.hs_arr || 0) > 0) return true;
+  if (Number(lp.hs_mrr || 0) > 0) return true;
+  if (Number(lp.hs_acv || 0) > 0) return true;
+  if (String(lp.hs_recurring_billing_terms || '').trim()) return true;
+  if (Number(lp.hs_term_in_months || 0) > 0) return true;
+
+  const name = String(lp.name || '');
+  if (ONE_TIME_NAME_PATTERN.test(name)) return false;
+  return true;
+}
+
 // Determines the [start, end] span for a single line item, preferring the line
 // item's own billing dates / term over the contract's dates. Used by
 // copyLineItemsToContract (so the contract line item carries real dates) and
@@ -1756,6 +1788,36 @@ app.get('/api/load-contract', async (req, res) => {
       }
     }
 
+    // Surface contract line items so the card can show implementation /
+    // onboarding (one-time) charges alongside subscription segments. Only
+    // one-time line items are returned — recurring line items are already
+    // represented as subscription segments and would double-count if also
+    // shown as line items in the UI.
+    let oneTimeLineItems = [];
+    try {
+      const lineItemIds = await getAssociatedIds(contractTypeId, contractId, 'line_items');
+      if (lineItemIds.length > 0) {
+        const lineItemResults = await Promise.allSettled(
+          lineItemIds.map((id) =>
+            getObject('line_items', id, [
+              'name', 'quantity', 'price', 'amount', 'hs_sku', 'description',
+              'hs_line_item_currency_code', 'hs_recurring_billing_period',
+              'hs_recurring_billing_start_date', 'hs_recurring_billing_end_date',
+              'hs_recurring_billing_number_of_payments', 'hs_recurring_billing_terms',
+              'recurringbillingfrequency', 'hs_acv', 'hs_arr', 'hs_mrr',
+              'hs_term_in_months', 'revenue_type',
+            ])
+          )
+        );
+        const lineItems = lineItemResults
+          .filter((r) => r.status === 'fulfilled')
+          .map((r) => r.value);
+        oneTimeLineItems = lineItems.filter((li) => !isRecurringLineItem(li));
+      }
+    } catch (e) {
+      console.warn('[load-contract] Failed to load contract line items:', e.response?.data?.message || e.message);
+    }
+
     const metrics = calcMetrics(subscriptions);
     const contractProps = contract.properties || {};
     const shouldUpdateRollups =
@@ -1846,6 +1908,7 @@ app.get('/api/load-contract', async (req, res) => {
       success: true,
       contract,
       subscriptions,
+      oneTimeLineItems,
       company,
       deals,
       dealsMeta,
@@ -3093,33 +3156,10 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
       return items;
     }
 
-    // DealHub-managed line items frequently omit hs_recurring_billing_period,
-    // so we use a multi-signal check and fall back to a name-based one-time
-    // heuristic (setup / onboarding / training / etc). Default for SaaS line
-    // items is RECURRING — explicit "one_time" markers or matching names flip
-    // the result.
-    const ONE_TIME_NAME_PATTERN =
-      /\b(setup|set[\s-]?up|onboarding|on[\s-]?boarding|implementation|installation|kick[\s-]?off|training|provisioning|one[\s-]?time|ad[\s-]?hoc|professional services)\b/i;
-
-    function isRecurringLineItem(li) {
-      const lp = li.properties || {};
-      const period = String(lp.hs_recurring_billing_period || '').trim().toLowerCase();
-      if (period === 'one_time' || period === 'onetime') return false;
-      const legacyFreq = String(lp.recurringbillingfrequency || '').trim().toLowerCase();
-      if (legacyFreq === 'one_time' || legacyFreq === 'onetime') return false;
-
-      if (period && period !== 'one_time' && period !== 'onetime') return true;
-      if (legacyFreq && legacyFreq !== 'one_time' && legacyFreq !== 'onetime') return true;
-      if (Number(lp.hs_arr || 0) > 0) return true;
-      if (Number(lp.hs_mrr || 0) > 0) return true;
-      if (Number(lp.hs_acv || 0) > 0) return true;
-      if (String(lp.hs_recurring_billing_terms || '').trim()) return true;
-      if (Number(lp.hs_term_in_months || 0) > 0) return true;
-
-      const name = String(lp.name || '');
-      if (ONE_TIME_NAME_PATTERN.test(name)) return false;
-      return true;
-    }
+    // isRecurringLineItem / ONE_TIME_NAME_PATTERN are defined at module
+    // scope so /api/load-contract can surface one-time charges
+    // (Implementation, Onboarding, etc.) in the contract card UI alongside
+    // recurring subscription segments.
 
     // ── Helper: create subscription segments from recurring line items ─
     // Creates ONE segment per recurring line item per contract year. One-time
