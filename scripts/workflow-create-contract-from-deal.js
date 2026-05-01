@@ -11,15 +11,22 @@
  *   lands in the correct forecast quarter. Amendment / expansion / contraction
  *   deals never spawn a renewal here (per Apr 28 training session).
  *
- * Renewal deal shape (per Apr 30 correction):
+ * Renewal deal shape (per May 1 correction):
  * - Term: inherits the FULL term of the source contract (e.g. a 3-year source
  *   spawns a 3-year renewal), not a fixed 1-year window.
  * - Line items: NONE. Renewals are placeholders for DealHub to quote into;
  *   we used to seed final-year recurring lines but that was wrong — the
  *   renewal deal stays empty until DealHub configures it.
- * - Amount: TCV of the source contract minus any one-time fees (i.e. the
- *   recurring TCV) so the forecast reflects the full multi-year renewal
- *   value instead of one annualized year.
+ * - Amount: LAST-SEGMENT ARR (single-year run rate at the END of the source
+ *   contract). For a source priced Y1=30K, Y2=35K, Y3=40K the renewal
+ *   amount is 40K — NOT 40K × renewal years and NOT total TCV. DealHub
+ *   replaces this with their own forecast when they quote into the deal.
+ *   Products whose final segment ends well before contract end (terminated
+ *   mid-contract) are excluded so they don't inflate the figure.
+ * - total_tcv on the renewal deal == amount (single-year placeholder until
+ *   DealHub's quote rebuilds it from line items).
+ * - year_1_arr on the renewal deal == amount (the run rate carried into
+ *   renewal Year 1).
  *
  * Workflow trigger requirements (configure in HubSpot UI):
  * - Trigger on Deal stage = Closed Won
@@ -44,12 +51,21 @@
  *    - renewalDealId (string)             — populated for new_business / renewal closes
  *    - renewalDealClosedate (string)      — YYYY-MM-DD; matches the new contract's end date
  *    - renewalLineItemsSeeded (number)    — always 0; renewals no longer seed line items (left for output-field stability)
- *    - renewalDealAmount (number)         — amount on the auto-spawned renewal deal (recurring TCV; one-time fees excluded)
+ *    - renewalDealAmount (number)         — amount on the auto-spawned renewal deal (last-segment ARR × renewal term years; one-time fees excluded)
  *    - renewalDealTermMonths (number)     — term of the spawned renewal deal in months (matches source contract term)
  *    - contractLineItemsCopied (number)   — # of source deal line items mirrored onto the contract
  *    - errorMessage (string)
  */
 const axios = require('axios');
+
+// Renewal deals must land in the FinQuery renewals pipeline, NOT the default
+// sales pipeline. IDs match railway-api/server.js so the workflow and the
+// shared helper agree on placement. Override via secrets on the workflow
+// action if a sandbox / non-prod portal needs different IDs.
+const RENEWAL_PIPELINE_ID =
+  process.env.RENEWAL_PIPELINE_ID || '860641302';
+const RENEWAL_DEAL_STAGE =
+  process.env.RENEWAL_DEAL_STAGE || '1331037727';
 
 const DEAL_PROPS = [
   'dealname',
@@ -65,22 +81,26 @@ const DEAL_PROPS = [
 const LINE_ITEM_PROPS = [
   'name',
   'description',
-  'quantity',
+  'dh_quantity',
   'price',
   'amount',
   'hs_sku',
   'hs_line_item_currency_code',
-  'hs_recurring_billing_period',
+  'dh_duration',
   'hs_recurring_billing_start_date',
   'hs_recurring_billing_end_date',
   'hs_recurring_billing_number_of_payments',
   'hs_recurring_billing_terms',
-  'recurringbillingfrequency',
   'hs_acv',
   'hs_arr',
   'hs_mrr',
   'hs_term_in_months',
   'revenue_type',
+  // DealHub's UI exposes simple `start_date` / `end_date` columns alongside
+  // (or instead of) the HubSpot-native hs_recurring_billing_* dates. Read
+  // both so we pick up whichever DealHub actually wrote.
+  'start_date',
+  'end_date',
 ];
 
 // Fields we mirror from the source deal line item onto each contract line
@@ -88,17 +108,16 @@ const LINE_ITEM_PROPS = [
 const CONTRACT_LINE_ITEM_PROPS = [
   'name',
   'description',
-  'quantity',
+  'dh_quantity',
   'price',
   'amount',
   'hs_sku',
   'hs_line_item_currency_code',
-  'hs_recurring_billing_period',
+  'dh_duration',
   'hs_recurring_billing_start_date',
   'hs_recurring_billing_end_date',
   'hs_recurring_billing_number_of_payments',
   'hs_recurring_billing_terms',
-  'recurringbillingfrequency',
   'hs_acv',
   'hs_arr',
   'hs_mrr',
@@ -106,10 +125,10 @@ const CONTRACT_LINE_ITEM_PROPS = [
   'revenue_type',
 ];
 
-// Common one-time charges. DealHub-managed line items often don't carry
-// hs_recurring_billing_period, so when no explicit recurring signal is set we
-// assume SaaS-default (recurring) and flip to one-time only when the line
-// item name matches a setup / onboarding / training / fee pattern.
+// Common one-time charges. DealHub-managed line items use the custom
+// `dh_duration` field (number of months — 0 / blank means one-time), but we
+// also fall back to a name-based heuristic for items where dh_duration was
+// never set (legacy imports, manually-created line items, etc.).
 const ONE_TIME_NAME_PATTERN =
   /\b(setup|set[\s-]?up|onboarding|on[\s-]?boarding|implementation|installation|kick[\s-]?off|training|provisioning|one[\s-]?time|ad[\s-]?hoc|professional services)\b/i;
 
@@ -228,47 +247,52 @@ function addMonths(dateObj, months) {
   return d;
 }
 
-// Parses HubSpot's ISO 8601 billing period strings ("P12M", "P1Y", ...) plus
-// the legacy "annual"/"monthly"/etc. tokens still present on imported line
-// items. Returns months as a number, or null when unparseable.
-function parsePeriodMonths(period) {
-  const raw = String(period || '').trim();
-  if (!raw) return null;
-  const lower = raw.toLowerCase();
-  if (lower === 'one_time' || lower === 'onetime') return null;
-  if (lower === 'annual' || lower === 'yearly') return 12;
-  if (lower === 'semi_annual' || lower === 'semi-annual') return 6;
-  if (lower === 'quarterly') return 3;
-  if (lower === 'monthly') return 1;
-  const iso = raw.toUpperCase().match(/^P(\d+)([MY])$/);
-  if (!iso) return null;
-  const num = Number(iso[1]);
-  if (!Number.isFinite(num) || num <= 0) return null;
-  return iso[2] === 'Y' ? num * 12 : num;
+// `dh_duration` is the DealHub-managed line item duration field stored as a
+// plain number of months. Returns months as a number, or null when the input
+// is missing/zero/non-recurring.
+function parseDhDuration(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.round(n);
 }
 
 // Resolves the [start, end] span for a single line item, preferring its own
 // recurring billing dates / term over the deal-level contract dates so a
 // 3-year line item generates 3 segments even when the deal-level dates only
-// cover 2.
-//   1. start = hs_recurring_billing_start_date, else fallback
-//   2. end   = hs_recurring_billing_end_date, else
-//              start + (number_of_payments × period months) - 1 day, else
+// cover 2. We accept multiple date-field conventions because DealHub may
+// populate the HubSpot-native fields, the simple `start_date`/`end_date`
+// custom fields, or a mix.
+//   1. start = hs_recurring_billing_start_date, else start_date, else fallback
+//   2. end   = hs_recurring_billing_end_date, else end_date, else
+//              start + (number_of_payments × dh_duration months) - 1 day, else
+//              start + dh_duration - 1 day (when DealHub sends a single
+//              dh_duration without a payments count — typical MDQ-style
+//              one-line-per-year payload), else
 //              start + hs_term_in_months - 1 day, else
 //              fallback
 function resolveLineItemSpan(lineItem, fallbackStart, fallbackEnd) {
   const lp = (lineItem && lineItem.properties) || {};
   const start =
     parseDateValue(lp.hs_recurring_billing_start_date) ||
+    parseDateValue(lp.start_date) ||
     parseDateValue(fallbackStart);
 
-  let end = parseDateValue(lp.hs_recurring_billing_end_date);
+  let end =
+    parseDateValue(lp.hs_recurring_billing_end_date) ||
+    parseDateValue(lp.end_date);
 
   if (!end && start) {
-    const periodMonths = parsePeriodMonths(lp.hs_recurring_billing_period) || 12;
+    const periodMonths = parseDhDuration(lp.dh_duration);
     const numPayments = Math.max(0, Number(lp.hs_recurring_billing_number_of_payments) || 0);
-    if (numPayments > 0) {
+    if (periodMonths && numPayments > 0) {
       end = addDays(addMonths(start, periodMonths * numPayments), -1);
+    } else if (periodMonths) {
+      // DealHub's MDQ-style payload sends ONE line item per product per year
+      // with `dh_duration = 12` and no payments count. Treat the duration as
+      // the line item's full span so it produces a single year-aligned
+      // segment instead of falling back to the deal-level contract dates.
+      end = addDays(addMonths(start, periodMonths), -1);
     } else {
       const termMonths = Math.max(0, Number(lp.hs_term_in_months) || 0);
       if (termMonths > 0) {
@@ -332,48 +356,73 @@ function buildYearSegments(startDateStr, endDateStr) {
 
 function getLineItemAnnualArr(lineItem) {
   const props = lineItem?.properties || {};
-  const quantity = Number(props.quantity || 1) || 1;
+  const quantity = Number(props.dh_quantity || 1) || 1;
   const unitPrice = Number(props.price || 0) || 0;
   return unitPrice * quantity;
+}
+
+// Returns the 1-indexed contract year that contains `segmentStart`, anchored
+// on the contract's own start date. e.g. a contract starting 2026-05-01 puts
+// segments starting 2026-05-01..2027-04-30 in Year 1, 2027-05-01..2028-04-30
+// in Year 2, etc.
+//
+// This is the SERVER-SIDE counterpart to the card's computeContractYearForDate.
+// It exists so segment_year is correctly stamped at write time when DealHub
+// sends MDQ-style line items (one line per product per year — each line
+// would otherwise be year=1 from buildYearSegments' perspective). With the
+// contract-anchored year stamped, the card's useSegmentYearBucketing path
+// works on the first read.
+function computeContractYear(segmentStartStr, contractStartStr) {
+  const segStart = parseDateValue(segmentStartStr);
+  const contractStart = parseDateValue(contractStartStr);
+  if (!segStart || !contractStart) return null;
+  const yearsDiff = segStart.getUTCFullYear() - contractStart.getUTCFullYear();
+  const monthsDiff = segStart.getUTCMonth() - contractStart.getUTCMonth();
+  const daysDiff = segStart.getUTCDate() - contractStart.getUTCDate();
+  let totalMonths = yearsDiff * 12 + monthsDiff;
+  if (daysDiff < 0) totalMonths -= 1;
+  const year = Math.floor(totalMonths / 12) + 1;
+  return year >= 1 ? year : 1;
 }
 
 function isRecurringLineItem(lineItem) {
   const props = lineItem?.properties || {};
 
-  // Hard one-time signal — explicit period of "one_time"/"onetime" wins.
-  const period = String(props.hs_recurring_billing_period || '').trim().toLowerCase();
-  if (period === 'one_time' || period === 'onetime') return false;
-  const legacyFreq = String(props.recurringbillingfrequency || '').trim().toLowerCase();
-  if (legacyFreq === 'one_time' || legacyFreq === 'onetime') return false;
+  // Primary signal — DealHub-managed `dh_duration` (months). 0 / blank = one-time.
+  const durationRaw = props.dh_duration;
+  const durationStr = String(durationRaw == null ? '' : durationRaw).trim();
+  if (durationStr !== '') {
+    return parseDhDuration(durationStr) !== null;
+  }
 
-  // Strong recurring signals.
-  if (period && period !== 'one_time' && period !== 'onetime') return true;
-  if (legacyFreq && legacyFreq !== 'one_time' && legacyFreq !== 'onetime') return true;
+  // Fallback signals for line items where dh_duration was never set
+  // (legacy imports, manually-created line items, etc.)
   if (Number(props.hs_arr || 0) > 0) return true;
   if (Number(props.hs_mrr || 0) > 0) return true;
   if (Number(props.hs_acv || 0) > 0) return true;
   if (String(props.hs_recurring_billing_terms || '').trim()) return true;
   if (Number(props.hs_term_in_months || 0) > 0) return true;
 
-  // No explicit recurring metadata. DealHub-managed line items rarely populate
-  // hs_recurring_billing_period, so we default to RECURRING for SaaS contexts
-  // and flip to one-time only for items whose name matches a known one-time
-  // charge pattern (setup, onboarding, training, etc.).
+  // No explicit recurring metadata. Default to RECURRING for SaaS contexts and
+  // flip to one-time only for items whose name matches a known one-time charge
+  // pattern (setup, onboarding, training, etc.).
   const name = String(props.name || '');
   if (ONE_TIME_NAME_PATTERN.test(name)) return false;
 
   return true;
 }
 
+// Use the FULL SKU as product_code so distinct DealHub SKUs (e.g. SUB-MO,
+// SUB-SU, SUB-PL, SRV-EN, SRV-ON) stay distinct on the segment record. The
+// previous behavior collapsed everything before the first `-`, so every
+// SaaS line item became `SUB` and every services line item became `SRV` —
+// that made segment_name identical across products and broke the contract
+// card's product breakdown. Falls back to product-name initials only when
+// no SKU is present.
 function deriveProductCode(lineItem) {
   const props = lineItem?.properties || {};
   const sku = String(props.hs_sku || '').trim();
-  if (sku) {
-    const upper = sku.toUpperCase();
-    const head = upper.split(/[-_\s]/)[0];
-    if (head) return head;
-    return upper;
-  }
+  if (sku) return sku.toUpperCase();
   const name = String(props.name || '').trim();
   if (!name) return 'PRODUCT';
   const initials = name
@@ -911,10 +960,16 @@ exports.main = async (event, callback) => {
 
     // totalArr  = annualized ARR (one year of recurring revenue, summed across recurring line items)
     // totalTcv  = total contract value (annual ARR × number of yearly segments per line item).
-    // The renewal deal's amount must be annual ARR (one year), NOT TCV — otherwise a
-    // 3-year contract spawns a 1-year renewal deal showing 3× the real renewal ACV.
+    //
+    // productLatestLine tracks each product's final-year line item so we can
+    // compute the "last segment ARR" — the run rate at the END of the source
+    // contract — which is what the renewal deal amount is forecast against
+    // (last-segment ARR × renewal term years). When a deal uses MDQ-style
+    // line items (one line per product per year), this naturally captures
+    // year-over-year uplifts (e.g. Y1=20K, Y2=25K, Y3=30K → last=30K).
     let totalArr = 0;
     let totalTcv = 0;
+    const productLatestLine = new Map();
     const segmentErrors = [];
 
     // One subscription segment per recurring line item per contract year. One-time
@@ -938,7 +993,7 @@ exports.main = async (event, callback) => {
       const lp = lineItem.properties || {};
       const productName = String(lp.name || 'Product').trim() || 'Product';
       const productCode = deriveProductCode(lineItem);
-      const quantity = Number(lp.quantity || 1) || 1;
+      const quantity = Number(lp.dh_quantity || 1) || 1;
       const unitPrice = Number(lp.price || 0) || 0;
       const annualArr = getLineItemAnnualArr(lineItem);
       const lineRevenueType = normalizeRevenueType(lp.revenue_type, dealRevenueType);
@@ -950,10 +1005,42 @@ exports.main = async (event, callback) => {
       totalArr += annualArr;
       totalTcv += annualArr * Math.max(lineYearSegments.length, 1);
 
+      // Track the line with the latest end_date per product so we can pick
+      // up the final-year ARR (post-uplift) for renewal forecasting. Group
+      // by SKU first; fall back to product name when SKU isn't set.
+      const productKey =
+        String(lp.hs_sku || '').trim() ||
+        String(lp.name || '').trim() ||
+        productCode ||
+        `LINE_${liIndex}`;
+      const lineEndDate = parseDateValue(lineSpan.endDate);
+      const previousLatest = productLatestLine.get(productKey);
+      if (
+        !previousLatest ||
+        (lineEndDate && (!previousLatest.endDate || lineEndDate > previousLatest.endDate))
+      ) {
+        productLatestLine.set(productKey, { endDate: lineEndDate, arr: annualArr });
+      }
+
       for (const [yearIdx, segmentYear] of lineYearSegments.entries()) {
+        // Anchor segment_year on the CONTRACT start, not the line item's own
+        // span. This is what makes DealHub's MDQ-style payloads (one line per
+        // product per year) bucket correctly in the contract card: each line
+        // produces a single segment whose year is 1/2/3 based on its date
+        // within the contract, instead of every line being year=1.
+        // Falls back to buildYearSegments' relative year when we can't
+        // determine the contract anchor (e.g. degenerate dates).
+        const contractAnchoredYear =
+          computeContractYear(segmentYear.start_date, derivedStartDate) ||
+          segmentYear.year;
+
+        // Prefer product_name in the visible segment_name so distinct
+        // products are readable in the contract card. Fall back to
+        // product_code only when product_name is missing.
+        const displayLabel = productName || productCode;
 
         const segmentPayloadRaw = {
-          segment_name: `${cleanedContractName} — ${productCode} Year ${segmentYear.year}`,
+          segment_name: `${cleanedContractName} — ${displayLabel} Year ${contractAnchoredYear}`,
           product_name: productName,
           product_code: productCode,
           quantity: String(quantity),
@@ -969,9 +1056,9 @@ exports.main = async (event, callback) => {
           subscription_end_date: lineSpan.endDate || derivedEndDate,
           arr_start_date: segmentYear.start_date,
           arr_end_date: segmentYear.end_date,
-          segment_year: String(segmentYear.year),
+          segment_year: String(contractAnchoredYear),
           segment_index: String(yearIdx + 1),
-          segment_label: `Year ${segmentYear.year}`,
+          segment_label: `Year ${contractAnchoredYear}`,
           segment_key: `${contract.id}-${liIndex + 1}-${yearIdx + 1}`,
           billing_frequency: 'annual',
           charge_type: 'recurring',
@@ -979,7 +1066,7 @@ exports.main = async (event, callback) => {
         };
 
         segmentPayloads.push(filterPropertiesForSchema(segmentPayloadRaw, subscriptionSchemaPropertyNames));
-        segmentLabels.push(`${productName} Year ${segmentYear.year}`);
+        segmentLabels.push(`${displayLabel} Year ${contractAnchoredYear}`);
       }
     }
 
@@ -1099,17 +1186,16 @@ exports.main = async (event, callback) => {
         const propsRaw = {
           name: lp.name || 'Product',
           description: lp.description || '',
-          quantity: lp.quantity || '1',
+          dh_quantity: lp.dh_quantity || '1',
           price: lp.price || '0',
           amount: lp.amount || '',
           hs_sku: lp.hs_sku || '',
           hs_line_item_currency_code: lp.hs_line_item_currency_code || '',
-          hs_recurring_billing_period: lp.hs_recurring_billing_period || '',
+          dh_duration: lp.dh_duration || '',
           hs_recurring_billing_start_date: span.startDate || lp.hs_recurring_billing_start_date || '',
           hs_recurring_billing_end_date: span.endDate || lp.hs_recurring_billing_end_date || '',
           hs_recurring_billing_number_of_payments: lp.hs_recurring_billing_number_of_payments || '',
           hs_recurring_billing_terms: lp.hs_recurring_billing_terms || '',
-          recurringbillingfrequency: lp.recurringbillingfrequency || '',
           hs_acv: lp.hs_acv || '',
           hs_arr: lp.hs_arr || '',
           hs_mrr: lp.hs_mrr || '',
@@ -1194,15 +1280,20 @@ exports.main = async (event, callback) => {
     // business + renewal categories; amendments / expansions / contractions
     // never spawn renewal deals from this workflow.
     //
-    // Per Apr 30 correction:
+    // Per May 1 correction:
     //   • Term: the renewal deal inherits the FULL TERM of the source contract
     //     (a 3-year source spawns a 3-year renewal), not a fixed 1-year span.
     //   • Line items: NONE — the renewal deal is a placeholder for DealHub to
     //     quote into. We used to seed final-year recurring lines but that was
     //     wrong; DealHub builds the renewal product set from scratch.
-    //   • Amount: source contract's recurring TCV (TCV minus any one-time
-    //     fees). totalTcv is already computed from recurring line items only,
-    //     so it equals (deal TCV − one-time fees) by construction.
+    //   • Amount: LAST-SEGMENT ARR (one year of recurring revenue at the
+    //     post-uplift run rate). For a source priced Y1=30K, Y2=35K, Y3=40K
+    //     the renewal amount = 40K. NOT multiplied by renewal years — the
+    //     renewal is a placeholder for DealHub to overwrite with their own
+    //     quote, and finance wants a single-year run-rate forecast on the
+    //     deal until that happens. Products whose final segment ends well
+    //     before contract end (terminated mid-contract) are excluded so
+    //     they don't inflate the figure.
     let renewalDealId = '';
     let renewalDealClosedate = '';
     let renewalLineItemsSeeded = 0;
@@ -1226,23 +1317,55 @@ exports.main = async (event, callback) => {
         const nextEnd = addDays(addMonths(nextStart, renewalTermMonths), -1);
         renewalDealClosedate = derivedEndDate;
 
-        // Renewal deal amount = recurring TCV of the source contract.
-        // totalTcv is summed from recurring line items only (one-time
-        // charges are excluded earlier in this workflow), so this is
-        // exactly "TCV minus one-time fees" without any extra subtraction.
-        renewalDealAmount = totalTcv > 0 ? totalTcv : (totalArr * (renewalTermMonths / 12));
+        // ── Compute last-segment ARR (run rate at source contract end) ─────
+        // For each product (grouped by SKU), pick the line with the latest
+        // end_date. Filter out products whose latest line ended well before
+        // the source contract end — those terminated mid-contract and won't
+        // be in the renewal. 30-day grace handles boundary-day rounding.
+        const contractEndForRenewal = parseDateValue(derivedEndDate);
+        const renewalCutoff = contractEndForRenewal
+          ? addDays(contractEndForRenewal, -30)
+          : null;
+        let lastSegmentArrSum = 0;
+        for (const { endDate, arr } of productLatestLine.values()) {
+          if (renewalCutoff && endDate && endDate < renewalCutoff) continue;
+          lastSegmentArrSum += arr;
+        }
+
+        // Renewal deal amount = last-segment ARR (single-year run rate, NOT
+        // multiplied by renewal term years). Falls back to totalArr when no
+        // products survive the cutoff filter (rare; happens when every line
+        // item terminates well before contract end).
+        const lastSegmentArrForRenewal = lastSegmentArrSum > 0
+          ? lastSegmentArrSum
+          : totalArr;
+        renewalDealAmount = lastSegmentArrForRenewal;
+
+        // total_tcv and year_1_arr both equal `amount` for renewals — the
+        // deal carries no line items for HubSpot to roll up, so we stamp
+        // them as a single-year forecast placeholder until DealHub overwrites
+        // when they configure the actual quote.
+        const renewalTotalTcv = renewalDealAmount;
+        const renewalYear1Arr = renewalDealAmount;
 
         const renewalDealName = `${cleanedContractName} — Renewal`;
-        const renewalDeal = await createObject(hs, '0-3', {
-          dealname: renewalDealName,
-          dealstage: 'appointmentscheduled',
-          deal_category: 'renewal',
-          contract_start_date: fmtDateForHS(nextStart),
-          contract_end_date: fmtDateForHS(nextEnd),
-          closedate: derivedEndDate,
-          amount: String(renewalDealAmount),
-          pipeline: 'default',
-        });
+        const renewalDeal = await createObjectWithFallback(
+          hs,
+          '0-3',
+          {
+            dealname: renewalDealName,
+            pipeline: RENEWAL_PIPELINE_ID,
+            dealstage: RENEWAL_DEAL_STAGE,
+            deal_category: 'renewal',
+            contract_start_date: fmtDateForHS(nextStart),
+            contract_end_date: fmtDateForHS(nextEnd),
+            closedate: derivedEndDate,
+            amount: String(renewalDealAmount),
+            total_tcv: String(renewalTotalTcv),
+            year_1_arr: String(renewalYear1Arr),
+          },
+          ['dealname', 'dealstage', 'amount', 'closedate']
+        );
         renewalDealId = String(renewalDeal.id);
 
         // Wire up the renewal deal to the contract, company, and contacts in
@@ -1275,7 +1398,9 @@ exports.main = async (event, callback) => {
           `Renewal deal ${renewalDeal.id} auto-created for contract ${contract.id} ` +
           `(${fmtDateForHS(nextStart)} → ${fmtDateForHS(nextEnd)}, ` +
           `term=${renewalTermMonths}mo, closedate=${derivedEndDate}, ` +
-          `amount=${renewalDealAmount} [recurring TCV], no line items seeded)`
+          `amount=${renewalDealAmount} [last-segment ARR], ` +
+          `total_tcv=${renewalTotalTcv}, year_1_arr=${renewalYear1Arr}, ` +
+          `no line items seeded)`
         );
       } catch (renewalErr) {
         // Failing to spawn the renewal deal must NOT fail the contract creation.

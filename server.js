@@ -786,31 +786,23 @@ function addMonthsToDate(dateObj, months) {
   return d;
 }
 
-// Parses ISO 8601 duration strings (HubSpot uses "P<n>M" / "P<n>Y" for billing
-// periods) plus the legacy "annual"/"monthly"/etc. tokens FinQuery still ships
-// on some imported line items. Returns months as a number, or null when the
-// input is unparseable.
-function parsePeriodMonths(period) {
-  const raw = String(period || '').trim();
-  if (!raw) return null;
-  const lower = raw.toLowerCase();
-  if (lower === 'one_time' || lower === 'onetime') return null;
-  if (lower === 'annual' || lower === 'yearly') return 12;
-  if (lower === 'semi_annual' || lower === 'semi-annual') return 6;
-  if (lower === 'quarterly') return 3;
-  if (lower === 'monthly') return 1;
-  const iso = raw.toUpperCase().match(/^P(\d+)([MY])$/);
-  if (!iso) return null;
-  const num = Number(iso[1]);
-  if (!Number.isFinite(num) || num <= 0) return null;
-  return iso[2] === 'Y' ? num * 12 : num;
+// `dh_duration` is the DealHub-managed line item duration field. It replaces
+// the HubSpot-native `hs_recurring_billing_period` and is stored as a plain
+// number of months (12 = annual, 1 = monthly, 3 = quarterly, 6 = semi-annual,
+// 0 / blank = one-time). Returns months as a number, or null when the input
+// is unparseable / non-recurring.
+function parseDhDuration(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.round(n);
 }
 
-// DealHub-managed line items frequently omit hs_recurring_billing_period,
-// so we use a multi-signal check and fall back to a name-based one-time
-// heuristic (setup / onboarding / training / etc). Default for SaaS line
-// items is RECURRING — explicit "one_time" markers or matching names flip
-// the result.
+// DealHub-managed line items frequently omit dh_duration, so we use a
+// multi-signal check and fall back to a name-based one-time heuristic
+// (setup / onboarding / training / etc). Default for SaaS line items is
+// RECURRING — an explicit `dh_duration` of 0 or matching one-time names
+// flip the result.
 //
 // Hoisted to module scope so /api/load-contract (which needs to surface
 // one-time implementation/onboarding line items in the UI) and
@@ -820,13 +812,15 @@ const ONE_TIME_NAME_PATTERN =
 
 function isRecurringLineItem(li) {
   const lp = (li && li.properties) || {};
-  const period = String(lp.hs_recurring_billing_period || '').trim().toLowerCase();
-  if (period === 'one_time' || period === 'onetime') return false;
-  const legacyFreq = String(lp.recurringbillingfrequency || '').trim().toLowerCase();
-  if (legacyFreq === 'one_time' || legacyFreq === 'onetime') return false;
+  const durationRaw = lp.dh_duration;
+  const durationStr = String(durationRaw == null ? '' : durationRaw).trim();
+  if (durationStr !== '') {
+    const months = parseDhDuration(durationStr);
+    return months !== null;
+  }
 
-  if (period && period !== 'one_time' && period !== 'onetime') return true;
-  if (legacyFreq && legacyFreq !== 'one_time' && legacyFreq !== 'onetime') return true;
+  // Fallback signals for line items where dh_duration was never set
+  // (legacy imports, manually-created line items, etc.)
   if (Number(lp.hs_arr || 0) > 0) return true;
   if (Number(lp.hs_mrr || 0) > 0) return true;
   if (Number(lp.hs_acv || 0) > 0) return true;
@@ -842,25 +836,39 @@ function isRecurringLineItem(li) {
 // item's own billing dates / term over the contract's dates. Used by
 // copyLineItemsToContract (so the contract line item carries real dates) and
 // createSegmentsFromLineItems (so a 3-year line item produces 3 segments even
-// when the deal-level contract dates were misconfigured).
-//   1. start = hs_recurring_billing_start_date, else fallback
-//   2. end   = hs_recurring_billing_end_date, else
-//              start + (number_of_payments × period months) - 1 day, else
+// when the deal-level contract dates were misconfigured). We accept multiple
+// date-field conventions because DealHub may populate the HubSpot-native
+// fields, the simple `start_date`/`end_date` custom fields, or a mix.
+//   1. start = hs_recurring_billing_start_date, else start_date, else fallback
+//   2. end   = hs_recurring_billing_end_date, else end_date, else
+//              start + (number_of_payments × dh_duration months) - 1 day, else
+//              start + dh_duration - 1 day (when DealHub sends a single
+//              dh_duration without a payments count — typical MDQ-style
+//              one-line-per-year payload), else
 //              start + hs_term_in_months - 1 day, else
 //              fallback
 function resolveLineItemSpan(lineItem, fallbackStart, fallbackEnd) {
   const lp = (lineItem && lineItem.properties) || {};
   const start =
     parseDateValue(lp.hs_recurring_billing_start_date) ||
+    parseDateValue(lp.start_date) ||
     parseDateValue(fallbackStart);
 
-  let end = parseDateValue(lp.hs_recurring_billing_end_date);
+  let end =
+    parseDateValue(lp.hs_recurring_billing_end_date) ||
+    parseDateValue(lp.end_date);
 
   if (!end && start) {
-    const periodMonths = parsePeriodMonths(lp.hs_recurring_billing_period) || 12;
+    const periodMonths = parseDhDuration(lp.dh_duration);
     const numPayments = Math.max(0, Number(lp.hs_recurring_billing_number_of_payments) || 0);
-    if (numPayments > 0) {
+    if (periodMonths && numPayments > 0) {
       end = addDaysToDate(addMonthsToDate(start, periodMonths * numPayments), -1);
+    } else if (periodMonths) {
+      // DealHub's MDQ-style payload sends ONE line item per product per year
+      // with `dh_duration = 12` and no payments count. Treat the duration as
+      // the line item's full span so it produces a single year-aligned
+      // segment instead of falling back to the deal-level contract dates.
+      end = addDaysToDate(addMonthsToDate(start, periodMonths), -1);
     } else {
       const termMonths = Math.max(0, Number(lp.hs_term_in_months) || 0);
       if (termMonths > 0) {
@@ -928,16 +936,16 @@ function buildYearSegments(startDateStr, endDateStr) {
   return segments;
 }
 
-// Derive a short product code for segment_name / product_code from a line item.
-// Prefers the head of hs_sku (e.g. "LQ-CORE" -> "LQ"); falls back to initials of
-// the product name.
+// Use the FULL SKU as product_code so distinct DealHub SKUs (e.g. SUB-MO,
+// SUB-SU, SUB-PL, SRV-EN, SRV-ON) stay distinct on the segment record. The
+// previous behavior collapsed everything before the first `-`, so every
+// SaaS line item became `SUB` and every services line item became `SRV` —
+// that made segment_name identical across products and broke the contract
+// card's product breakdown. Falls back to product-name initials only when
+// no SKU is present.
 function deriveProductCode(lineItemProps = {}) {
   const sku = String(lineItemProps.hs_sku || '').trim();
-  if (sku) {
-    const head = sku.toUpperCase().split(/[-_\s]/)[0];
-    if (head) return head;
-    return sku.toUpperCase();
-  }
+  if (sku) return sku.toUpperCase();
   const name = String(lineItemProps.name || '').trim();
   if (!name) return 'PRODUCT';
   const initials = name
@@ -954,6 +962,29 @@ function toMidnight(value) {
   if (!d) return null;
   d.setHours(0, 0, 0, 0);
   return d;
+}
+
+// Returns the 1-indexed contract year that contains `segmentStart`, anchored
+// on the contract's own start date. e.g. a contract starting 2026-05-01 puts
+// segments starting 2026-05-01..2027-04-30 in Year 1, 2027-05-01..2028-04-30
+// in Year 2, etc.
+//
+// Used at write-time so segment_year is correctly stamped when DealHub sends
+// MDQ-style line items (one line per product per year — each line would
+// otherwise be year=1 from buildYearSegments' perspective). With the
+// contract-anchored year stamped, the contract card's useSegmentYearBucketing
+// path works on the first read. Mirrors the card's computeContractYearForDate.
+function computeContractYear(segmentStartStr, contractStartStr) {
+  const segStart = parseDateValue(segmentStartStr);
+  const contractStart = parseDateValue(contractStartStr);
+  if (!segStart || !contractStart) return null;
+  const yearsDiff = segStart.getFullYear() - contractStart.getFullYear();
+  const monthsDiff = segStart.getMonth() - contractStart.getMonth();
+  const daysDiff = segStart.getDate() - contractStart.getDate();
+  let totalMonths = yearsDiff * 12 + monthsDiff;
+  if (daysDiff < 0) totalMonths -= 1;
+  const year = Math.floor(totalMonths / 12) + 1;
+  return year >= 1 ? year : 1;
 }
 
 function chooseCurrentSegmentYear(subscriptions) {
@@ -1052,6 +1083,83 @@ function chooseCurrentSegmentYear(subscriptions) {
   return ordered[0];
 }
 
+// Picks the FINAL segment-year bucket for a set of subscription segments —
+// the run rate at the END of the contract. Used by the renewal helper to
+// project the renewal deal amount against the most recent (post-uplift)
+// pricing instead of multi-year TCV. Mirrors chooseCurrentSegmentYear's
+// bucketing logic so both helpers see segments the same way.
+function chooseLastSegmentYear(subscriptions) {
+  const rows = [];
+  for (const sub of subscriptions) {
+    const sp = sub.properties || {};
+    if (sp.status === 'terminated') continue;
+    const arr = parseFloat(sp.arr) || 0;
+    const tcv = parseFloat(sp.tcv) || 0;
+    const code = (sp.product_code || '').toUpperCase();
+    const start = toMidnight(
+      sp.start_date || sp.segment_start_date || sp.subscription_start_date || sp.arr_start_date,
+    );
+    const end = toMidnight(
+      sp.end_date || sp.segment_end_date || sp.subscription_end_date || sp.arr_end_date,
+    );
+    const segYearRaw = parseInt(sp.segment_year, 10);
+    const segYear = Number.isFinite(segYearRaw) && segYearRaw > 0 ? segYearRaw : null;
+    rows.push({ arr, tcv, code, start, end, segYear });
+  }
+  if (rows.length === 0) return null;
+
+  const distinctYears = new Set(rows.map((r) => r.segYear).filter(Boolean));
+  const useSegYear = distinctYears.size >= 2;
+
+  const buckets = new Map();
+  for (const r of rows) {
+    let key;
+    if (useSegYear && r.segYear) {
+      key = `y${r.segYear}`;
+    } else if (r.start) {
+      key = `d${r.start.getTime()}`;
+    } else {
+      key = 'unknown';
+    }
+    if (!buckets.has(key)) {
+      buckets.set(key, {
+        year: useSegYear && r.segYear ? r.segYear : null,
+        arr: 0,
+        tcv: 0,
+        lqArr: 0,
+        fcmArr: 0,
+        earliestStart: null,
+        latestEnd: null,
+      });
+    }
+    const bucket = buckets.get(key);
+    bucket.arr += r.arr;
+    bucket.tcv += r.tcv;
+    if (r.code === 'LQ') bucket.lqArr += r.arr;
+    if (r.code === 'FCM') bucket.fcmArr += r.arr;
+    if (r.start && (!bucket.earliestStart || r.start < bucket.earliestStart)) {
+      bucket.earliestStart = r.start;
+    }
+    if (r.end && (!bucket.latestEnd || r.end > bucket.latestEnd)) {
+      bucket.latestEnd = r.end;
+    }
+  }
+
+  if (buckets.size === 0) return null;
+
+  const ordered = Array.from(buckets.values()).sort((a, b) => {
+    if (a.year && b.year) return a.year - b.year;
+    const aTime = a.earliestStart ? a.earliestStart.getTime() : Number.MAX_SAFE_INTEGER;
+    const bTime = b.earliestStart ? b.earliestStart.getTime() : Number.MAX_SAFE_INTEGER;
+    return aTime - bTime;
+  });
+  ordered.forEach((b, idx) => {
+    if (!b.year) b.year = idx + 1;
+  });
+
+  return ordered[ordered.length - 1];
+}
+
 function calcMetrics(subscriptions) {
   const metrics = { total_arr: 0, total_tcv: 0, lq_arr: 0, fcm_arr: 0, subscription_count: subscriptions.length };
   const currentSegment = chooseCurrentSegmentYear(subscriptions);
@@ -1120,15 +1228,6 @@ function buildInheritedProductDescription(baseDescription, productKey) {
     .replace(/\s*\|\s*FQ_INHERITED_PRODUCT_KEY:[a-z0-9-]+\s*$/i, '')
     .trim();
   return `${base ? `${base} | ` : ''}${INHERITED_PRODUCT_MARKER}${productKey}`;
-}
-
-function normalizeRecurringPeriod(periodRaw) {
-  const period = String(periodRaw || '').trim();
-  if (!period) return null;
-  const lower = period.toLowerCase();
-  if (lower === 'one_time' || lower === 'onetime') return null;
-  if (lower === 'annual') return 'P12M';
-  return period;
 }
 
 function stripUnsupportedLineItemProps(err, properties) {
@@ -1357,13 +1456,13 @@ async function syncContractRecurringLineItemsToDeal(contractId, dealId, options 
       inheritableSubs = Array.from(segmentsByProduct.values());
 
       if (inheritableSubs.length > 0) {
-        const billingFrequencyToPeriod = (billingFrequencyRaw) => {
+        const billingFrequencyToMonths = (billingFrequencyRaw) => {
           const value = String(billingFrequencyRaw || '').trim().toLowerCase();
-          if (value === 'monthly') return 'P1M';
-          if (value === 'quarterly') return 'P3M';
-          if (value === 'semi-annual' || value === 'semi_annual') return 'P6M';
-          if (value === 'annual' || value === 'yearly') return 'P12M';
-          return 'P12M';
+          if (value === 'monthly') return 1;
+          if (value === 'quarterly') return 3;
+          if (value === 'semi-annual' || value === 'semi_annual') return 6;
+          if (value === 'annual' || value === 'yearly') return 12;
+          return 12;
         };
 
         recurringSourceItems = inheritableSubs.map((sub, index) => {
@@ -1381,11 +1480,11 @@ async function syncContractRecurringLineItemsToDeal(contractId, dealId, options 
             id: sub.id || `fallback-sub-${index + 1}`,
             properties: {
               name: p.product_name || p.product_code || `Subscription ${index + 1}`,
-              quantity: String(quantity > 0 ? quantity : 1),
+              dh_quantity: String(quantity > 0 ? quantity : 1),
               price: String(Math.max(0, computedUnitPrice || 0)),
               hs_sku: p.product_code || '',
               description: '',
-              hs_recurring_billing_period: billingFrequencyToPeriod(p.billing_frequency),
+              dh_duration: String(billingFrequencyToMonths(p.billing_frequency)),
               revenue_type: p.revenue_type || fallbackRevenueType,
             },
           };
@@ -1415,15 +1514,15 @@ async function syncContractRecurringLineItemsToDeal(contractId, dealId, options 
       : await Promise.all(
         sourceLineItemIds.map((id) =>
           getObject('line_items', id, [
-            'name', 'quantity', 'price', 'hs_sku', 'description',
-            'hs_recurring_billing_period', 'revenue_type',
+            'name', 'dh_quantity', 'price', 'hs_sku', 'description',
+            'dh_duration', 'revenue_type',
           ])
         )
       );
 
     recurringSourceItems = sourceItems.filter((item) => {
-      const period = normalizeRecurringPeriod(item?.properties?.hs_recurring_billing_period);
-      return !!period;
+      const months = parseDhDuration(item?.properties?.dh_duration);
+      return months !== null;
     });
 
     if (recurringSourceItems.length > 0) {
@@ -1457,11 +1556,11 @@ async function syncContractRecurringLineItemsToDeal(contractId, dealId, options 
     const sku = String(props.hs_sku || '').trim();
     const name = String(props.name || 'Product').trim() || 'Product';
     const key = sanitizeProductKey(sku || name, `product-${index + 1}`);
-    const qty = Math.max(0, parseFloat(props.quantity) || 0);
+    const qty = Math.max(0, parseFloat(props.dh_quantity) || 0);
     const quantity = qty > 0 ? qty : 1;
     const unitPrice = Math.max(0, parseFloat(props.price) || 0);
     const lineAmount = quantity * unitPrice;
-    const period = normalizeRecurringPeriod(props.hs_recurring_billing_period) || 'P12M';
+    const durationMonths = parseDhDuration(props.dh_duration) || 12;
 
     if (!groupedByProduct[key]) {
       groupedByProduct[key] = {
@@ -1470,7 +1569,7 @@ async function syncContractRecurringLineItemsToDeal(contractId, dealId, options 
         sku,
         quantity: 0,
         amount: 0,
-        period,
+        durationMonths,
         hasExpansion: false,
       };
     }
@@ -1478,7 +1577,7 @@ async function syncContractRecurringLineItemsToDeal(contractId, dealId, options 
     groupedByProduct[key].quantity += quantity;
     groupedByProduct[key].amount += lineAmount;
     if (!groupedByProduct[key].sku && sku) groupedByProduct[key].sku = sku;
-    if (period) groupedByProduct[key].period = period;
+    if (durationMonths) groupedByProduct[key].durationMonths = durationMonths;
 
     const revenueType = normalizeLineRevenueType(props.revenue_type, fallbackRevenueType);
     if (revenueType === 'expansion' || revenueType === 'cross_sell' || revenueType === 'new') {
@@ -1526,11 +1625,11 @@ async function syncContractRecurringLineItemsToDeal(contractId, dealId, options 
     const unitPrice = quantity > 0 ? (item.amount / quantity) : item.amount;
     const lineProps = {
       name: item.name || 'Product',
-      quantity: String(quantity),
+      dh_quantity: String(quantity),
       price: toPriceString(unitPrice),
       hs_sku: item.sku || '',
       description: buildInheritedProductDescription(item.name, item.key),
-      hs_recurring_billing_period: item.period || 'P12M',
+      dh_duration: String(item.durationMonths || 12),
       revenue_type: item.hasExpansion ? 'expansion' : normalizeLineRevenueType('', fallbackRevenueType),
     };
     if (lineStartDate) lineProps.hs_recurring_billing_start_date = lineStartDate;
@@ -1733,7 +1832,7 @@ app.get('/api/test-line-item', async (req, res) => {
       try {
         const lineItem = await createObject('line_items', {
           name: 'TEST — Delete Me',
-          quantity: '1',
+          dh_quantity: '1',
           price: '0',
         }, [{
           to: { id: dealId },
@@ -1800,11 +1899,11 @@ app.get('/api/load-contract', async (req, res) => {
         const lineItemResults = await Promise.allSettled(
           lineItemIds.map((id) =>
             getObject('line_items', id, [
-              'name', 'quantity', 'price', 'amount', 'hs_sku', 'description',
-              'hs_line_item_currency_code', 'hs_recurring_billing_period',
+              'name', 'dh_quantity', 'price', 'amount', 'hs_sku', 'description',
+              'hs_line_item_currency_code', 'dh_duration',
               'hs_recurring_billing_start_date', 'hs_recurring_billing_end_date',
               'hs_recurring_billing_number_of_payments', 'hs_recurring_billing_terms',
-              'recurringbillingfrequency', 'hs_acv', 'hs_arr', 'hs_mrr',
+              'hs_acv', 'hs_arr', 'hs_mrr',
               'hs_term_in_months', 'revenue_type',
             ])
           )
@@ -2124,14 +2223,25 @@ app.get('/api/reverse-termination', async (req, res) => {
 
 // ── Helper: Resolve renewal term + amount for a contract ────────────────────
 // Renewal deals inherit the FULL term of the source contract (e.g. a 3-year
-// contract spawns a 3-year renewal) and the amount is the source contract's
-// recurring TCV — i.e. TCV minus any one-time fees.
+// contract spawns a 3-year renewal). The deal amount is the LAST-SEGMENT ARR
+// of the source contract — a single-year run-rate placeholder that DealHub
+// overwrites with their own forecast when they configure the renewal quote.
 //
-// total_tcv on the contract is rolled up from subscription segments only
-// (created from recurring line items), so it already excludes one-time
-// charges and equals "TCV − one-time fees" by construction. When the field
-// is missing/zero we fall back to total_arr × term-years so a contract that
-// hasn't been re-rollup'd still spawns a sensible renewal amount.
+// "Last-segment ARR" is the recurring run rate at the END of the source
+// contract — the post-uplift annual ARR the customer is paying in the
+// final year. For a 3-year deal priced 30K → 35K → 40K the last segment
+// is 40K and the renewal deal amount = 40K (NOT multiplied by renewal
+// term years; finance wants the single-year run-rate placeholder).
+//
+// Fallback chain (each level kicks in when the previous data isn't
+// available):
+//   1. last-segment ARR from the live subscription rollup, when subscriptions
+//      are passed in
+//   2. props.total_arr (current run rate stored on the contract — good for
+//      contracts that haven't been re-rollup'd yet, since total_arr is the
+//      ARR of the currently-active segment year)
+//   3. props.total_tcv as a final placeholder (preserves prior behavior for
+//      very old contracts that never had segments rolled up)
 function resolveRenewalTermMonths(props = {}) {
   const explicit = parseInt(props.contract_term, 10);
   if (Number.isFinite(explicit) && explicit > 0) return explicit;
@@ -2147,12 +2257,19 @@ function resolveRenewalTermMonths(props = {}) {
   return months > 0 ? months : 12;
 }
 
-function resolveRenewalAmount(props = {}, termMonths = 12) {
+function resolveRenewalAmount(props = {}, _termMonths = 12, subscriptions = null) {
+  if (Array.isArray(subscriptions) && subscriptions.length > 0) {
+    const last = chooseLastSegmentYear(subscriptions);
+    if (last && last.arr > 0) return last.arr;
+  }
+
+  const arr = Number(props.total_arr) || 0;
+  if (arr > 0) return arr;
+
   const tcv = Number(props.total_tcv);
   if (Number.isFinite(tcv) && tcv > 0) return tcv;
-  const arr = Number(props.total_arr) || 0;
-  const years = termMonths / 12;
-  return arr * years;
+
+  return 0;
 }
 
 // ── Helper: Create a renewal deal for a given contract ───────────────────────
@@ -2163,12 +2280,17 @@ function resolveRenewalAmount(props = {}, termMonths = 12) {
 //     immediately on Closed Won so the next-cycle deal shows in the forecast,
 //     not at end-of-term + 1)
 //
-// Per Apr 30 correction:
+// Per May 1 correction:
 //   • Term: inherits the full source-contract term (12 / 24 / 36 mo etc.).
 //   • Line items: NONE — DealHub configures the renewal product set from
 //     scratch when quoting. We no longer seed final-year recurring lines.
-//   • Amount: source recurring TCV (total_tcv on the contract already
-//     excludes one-time fees).
+//   • Amount: last-segment ARR (single-year post-uplift run rate at source
+//     contract end). NOT multiplied by renewal years and NOT total TCV —
+//     finance wants a single-year placeholder for forecasting until DealHub
+//     overwrites with their own quote.
+//   • total_tcv on the renewal deal == amount (placeholder until DealHub
+//     rebuilds it from line items).
+//   • year_1_arr on the renewal deal == amount (renewal Y1 baseline).
 //
 // Returns { success, dealId, dealName, lineItemsCreated, warnings, existing? }.
 async function createRenewalDealForContract(contractId, options = {}) {
@@ -2176,6 +2298,7 @@ async function createRenewalDealForContract(contractId, options = {}) {
     nameSuffix = 'Renewal',           // e.g. 'Renewal', 'Auto-Renewal'
     closeDateOverride = null,         // close date should = current contract end date for forecasting
     contractPropsOverride = null,     // optional pre-fetched props to avoid an extra GET
+    subscriptionsOverride = null,     // optional pre-fetched subs (skip the lookup)
     skipIfOpenRenewalExists = true,
     pipeline = RENEWAL_PIPELINE_ID,
     dealStage = RENEWAL_DEAL_STAGE,
@@ -2186,8 +2309,39 @@ async function createRenewalDealForContract(contractId, options = {}) {
   const props = contractPropsOverride
     || (await getObject(contractTypeId, contractId, CONTRACT_PROPS)).properties;
 
+  // Pull subscription segments so resolveRenewalAmount can pick the LAST
+  // segment's ARR (post-uplift run rate). Caller can pass them in to avoid
+  // the extra round-trips.
+  let subscriptions = subscriptionsOverride;
+  if (!Array.isArray(subscriptions) && subscriptionTypeId) {
+    try {
+      const subIds = await getAssociatedIds(contractTypeId, contractId, subscriptionTypeId);
+      if (subIds.length > 0) {
+        const fetched = await Promise.all(
+          subIds.map((id) =>
+            getObject(subscriptionTypeId, id, SUBSCRIPTION_PROPS).catch(() => null)
+          )
+        );
+        subscriptions = fetched.filter(Boolean);
+      } else {
+        subscriptions = [];
+      }
+    } catch (e) {
+      console.warn(
+        `[renewal-helper] Could not load subscriptions for contract ${contractId}; falling back to contract rollups: ${e.message}`
+      );
+      subscriptions = [];
+    }
+  }
+
   const termMonths = resolveRenewalTermMonths(props);
-  const renewalAmount = resolveRenewalAmount(props, termMonths);
+  const renewalAmount = resolveRenewalAmount(props, termMonths, subscriptions);
+
+  // total_tcv and year_1_arr both equal `amount` for renewals: the deal
+  // carries no seeded line items, so HubSpot can't roll up TCV on its own,
+  // and the source contract's last-segment ARR IS the renewal-Year-1 run
+  // rate. DealHub overwrites both fields when they configure the quote.
+  const renewalYear1Arr = renewalAmount;
 
   const currentEndDate = parseDateValue(getContractEndDate(props)) || new Date();
   const renewalStart = new Date(currentEndDate);
@@ -2238,7 +2392,11 @@ async function createRenewalDealForContract(contractId, options = {}) {
   const closeDate = closeDateOverride
     || fmtDateForHS(parseDateValue(getContractEndDate(props)) || renewalStart);
 
-  const deal = await createObject('0-3', {
+  // Build the renewal deal payload. total_tcv mirrors `amount` (no seeded
+  // line items means HubSpot has nothing to roll up) and year_1_arr is the
+  // run rate at the start of renewal Y1. Both fall back gracefully if those
+  // custom deal properties don't exist on the portal yet — see catch below.
+  const dealPropsFull = {
     dealname: dealName,
     dealstage: dealStage,
     deal_category: 'renewal',
@@ -2246,8 +2404,33 @@ async function createRenewalDealForContract(contractId, options = {}) {
     contract_end_date: fmtDateForHS(renewalEnd),
     closedate: closeDate,
     amount: String(renewalAmount),
+    total_tcv: String(renewalAmount),
+    year_1_arr: String(renewalYear1Arr),
     pipeline,
-  });
+  };
+  let deal;
+  try {
+    deal = await createObject('0-3', dealPropsFull);
+  } catch (createErr) {
+    const msg = createErr.response?.data?.message || createErr.message || '';
+    // If total_tcv / year_1_arr aren't defined on this portal, retry without
+    // them so the renewal deal still gets created. Run the create-deal-
+    // properties.js script to enable forecasting fields permanently.
+    if (/property\s+\\?"?(total_tcv|year_1_arr)\\?"?/i.test(msg) || /PROPERTY_DOESNT_EXIST/i.test(msg)) {
+      console.warn(
+        `[renewal-helper] total_tcv/year_1_arr not defined on deals — retrying without them. Run scripts/create-deal-properties.js to enable: ${msg}`
+      );
+      const fallbackProps = { ...dealPropsFull };
+      delete fallbackProps.total_tcv;
+      delete fallbackProps.year_1_arr;
+      deal = await createObject('0-3', fallbackProps);
+      warnings.push(
+        'Renewal deal created without total_tcv/year_1_arr — those deal properties are missing. Run scripts/create-deal-properties.js to add them.'
+      );
+    } else {
+      throw createErr;
+    }
+  }
 
   const companyIds = await getAssociatedIds(contractTypeId, contractId, '0-2');
   if (companyIds.length > 0) {
@@ -2280,14 +2463,15 @@ async function createRenewalDealForContract(contractId, options = {}) {
   }
 
   // Renewal deals do NOT carry line items — DealHub builds the renewal
-  // product set from scratch when quoting. The deal's `amount` already
-  // reflects the recurring TCV so finance has a forecast number to work
-  // with until DealHub fills in the products.
+  // product set from scratch when quoting. amount, total_tcv, and
+  // year_1_arr all carry the source contract's last-segment ARR as a
+  // single-year placeholder until DealHub fills in the products.
   const lineItemsCreated = 0;
 
   console.log(
     `[renewal-helper] Created renewal deal ${deal.id} for contract ${contractId}: ` +
-    `term=${termMonths}mo, amount=${renewalAmount} [recurring TCV], ` +
+    `term=${termMonths}mo, amount=${renewalAmount} [last-segment ARR], ` +
+    `total_tcv=${renewalAmount}, year_1_arr=${renewalYear1Arr}, ` +
     `closeDate=${closeDate} (${fmtDateForHS(renewalStart)} → ${fmtDateForHS(renewalEnd)}), ` +
     `no line items seeded (DealHub configures on quote)`
   );
@@ -2452,9 +2636,10 @@ app.get('/api/check-auto-renewals', async (req, res) => {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-    // Pull total_tcv + contract_term so resolveRenewalAmount /
-    // resolveRenewalTermMonths can reuse the same logic as the manual
-    // renewal helper without an extra round-trip per contract.
+    // Pull total_arr / total_tcv / contract_term so resolveRenewalAmount /
+    // resolveRenewalTermMonths have the data they need for the contract-prop
+    // fallback paths. The helper itself fetches subscription segments per
+    // contract so it can compute last-segment ARR (post-uplift run rate).
     const { data } = await hs.post(`/crm/v3/objects/${contractTypeId}/search`, {
       filterGroups: [{
         filters: [
@@ -2480,7 +2665,7 @@ app.get('/api/check-auto-renewals', async (req, res) => {
       try {
         // Reuse the shared helper so auto-renewal honors the same term +
         // amount + line-item policy as manual renewal (full source-contract
-        // term, recurring TCV amount, no line items seeded).
+        // term, last-segment ARR × renewal years amount, no line items seeded).
         const result = await createRenewalDealForContract(c.id, {
           nameSuffix: 'Auto-Renewal',
           contractPropsOverride: c.properties,
@@ -3026,9 +3211,9 @@ app.post('/api/upsert-demo-line-items', async (req, res) => {
           'description',
           'name',
           'price',
-          'quantity',
+          'dh_quantity',
           'hs_sku',
-          'hs_recurring_billing_period',
+          'dh_duration',
           'hs_recurring_billing_start_date',
           'revenue_type',
         ]);
@@ -3053,10 +3238,10 @@ app.post('/api/upsert-demo-line-items', async (req, res) => {
 
       const props = {
         name: `Demo CPQ - ${item.productName || item.productCode || item.key}`,
-        quantity: String(quantity > 0 ? quantity : 1),
+        dh_quantity: String(quantity > 0 ? quantity : 1),
         price: toPriceString(unitPrice),
         hs_sku: item.productCode || `DEMO-${item.key.toUpperCase()}`,
-        hs_recurring_billing_period: 'P12M',
+        dh_duration: '12',
         description: `FinQuery CPQ demo line item | FQ_DEMO_PRODUCT_KEY:${item.key}${item.year ? ` | FQ_DEMO_YEAR:${item.year}` : ''}`,
         revenue_type: item.revenueType,
       };
@@ -3144,12 +3329,15 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
       const items = await Promise.all(
         lineItemIds.map((id) =>
           getObject('line_items', id, [
-            'name', 'quantity', 'price', 'amount', 'hs_sku', 'description',
-            'hs_line_item_currency_code', 'hs_recurring_billing_period',
+            'name', 'dh_quantity', 'price', 'amount', 'hs_sku', 'description',
+            'hs_line_item_currency_code', 'dh_duration',
             'hs_recurring_billing_start_date', 'hs_recurring_billing_end_date',
             'hs_recurring_billing_number_of_payments', 'hs_recurring_billing_terms',
-            'recurringbillingfrequency', 'hs_acv', 'hs_arr', 'hs_mrr',
+            'hs_acv', 'hs_arr', 'hs_mrr',
             'hs_term_in_months', 'revenue_type',
+            // DealHub's UI exposes simple `start_date` / `end_date` columns
+            // alongside (or instead of) the HubSpot-native dates. Read both.
+            'start_date', 'end_date',
           ])
         )
       );
@@ -3185,7 +3373,7 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
 
       for (const [liIndex, li] of recurringItems.entries()) {
         const lp = li.properties || {};
-        const qty = parseInt(lp.quantity) || 1;
+        const qty = parseInt(lp.dh_quantity) || 1;
         const unitPrice = parseFloat(lp.price) || 0;
         const annualArr = unitPrice * qty;
         const productName = String(lp.name || 'Product').trim() || 'Product';
@@ -3230,8 +3418,24 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
         }
 
         for (const [yearIdx, segYear] of yearSegments.entries()) {
+          // Anchor segment_year on the CONTRACT start, not the line item's
+          // own span. This is what makes DealHub's MDQ-style payloads (one
+          // line per product per year) bucket correctly in the contract
+          // card: each line produces a single segment whose year is 1/2/3
+          // based on its date within the contract, instead of every line
+          // being year=1. Falls back to buildYearSegments' relative year
+          // when we can't determine the contract anchor (degenerate dates).
+          const contractAnchoredYear =
+            computeContractYear(segYear.start_date, startDate) ||
+            segYear.year;
+
+          // Prefer product_name in the visible segment_name so distinct
+          // products are readable in the contract card. Fall back to
+          // product_code only when product_name is missing.
+          const displayLabel = productName || productCode;
+
           const segProps = {
-            segment_name: `${cleanContractName} — ${productCode} Year ${segYear.year}`,
+            segment_name: `${cleanContractName} — ${displayLabel} Year ${contractAnchoredYear}`,
             product_name: productName,
             product_code: productCode,
             quantity: String(qty),
@@ -3247,9 +3451,9 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
             subscription_end_date: lineSpan.endDate || endDate,
             arr_start_date: segYear.start_date,
             arr_end_date: segYear.end_date,
-            segment_year: String(segYear.year),
+            segment_year: String(contractAnchoredYear),
             segment_index: String(yearIdx + 1),
-            segment_label: `Year ${segYear.year}`,
+            segment_label: `Year ${contractAnchoredYear}`,
             segment_key: `${cId}-${liIndex + 1}-${yearIdx + 1}`,
             billing_frequency: 'annual',
             charge_type: 'recurring',
@@ -3265,7 +3469,7 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
           }
           created++;
           console.log(
-            `[update-contract] Created segment ${seg.id}: ${productName} Year ${segYear.year} ` +
+            `[update-contract] Created segment ${seg.id}: ${displayLabel} Year ${contractAnchoredYear} ` +
             `x${qty} @ ${unitPrice} [${segYear.start_date} → ${segYear.end_date}]`
           );
         }
@@ -3297,18 +3501,17 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
         try {
           const propsRaw = {
             name: lp.name || 'Product',
-            quantity: lp.quantity || '1',
+            dh_quantity: lp.dh_quantity || '1',
             price: lp.price || '0',
             amount: lp.amount || '',
             hs_sku: lp.hs_sku || '',
             description: lp.description || '',
             hs_line_item_currency_code: lp.hs_line_item_currency_code || '',
-            hs_recurring_billing_period: lp.hs_recurring_billing_period || '',
+            dh_duration: lp.dh_duration || '',
             hs_recurring_billing_start_date: span.startDate || lp.hs_recurring_billing_start_date || '',
             hs_recurring_billing_end_date: span.endDate || lp.hs_recurring_billing_end_date || '',
             hs_recurring_billing_number_of_payments: lp.hs_recurring_billing_number_of_payments || '',
             hs_recurring_billing_terms: lp.hs_recurring_billing_terms || '',
-            recurringbillingfrequency: lp.recurringbillingfrequency || '',
             hs_acv: lp.hs_acv || '',
             hs_arr: lp.hs_arr || '',
             hs_mrr: lp.hs_mrr || '',
