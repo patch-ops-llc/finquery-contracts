@@ -9,7 +9,7 @@
  *       PRODUCT_REGISTRY) plus an optional one-time implementation fee
  *     - Sensible deal property defaults for a "new business" deal
  *       (deal_category, contract_start_date, contract_end_date, revenue_type,
- *       amount, closedate)
+ *       amount, closedate, total_tcv, year_1_arr)
  *     - All associations: company <-> deal, contacts <-> deal, contacts <->
  *       company, line items <-> deal
  *
@@ -46,6 +46,11 @@
  *                                       fee one-time line item (default: true)
  *        - companyName (string)       : Override company name (default: random)
  *        - numContacts (number)       : 1, 2, or 3 (default: random by seed)
+ *        - upliftPct (number)         : Annual uplift % applied compoundingly
+ *                                       to each subsequent segment year (e.g.
+ *                                       7 = +7% per year). Default: random in
+ *                                       persona's range. Pass 0 for flat
+ *                                       pricing across years.
  *
  *   Recurring products are emitted as one line item PER 12-month segment year
  *   (so a 36-month term produces 3 LQ + 3 FCM line items, each tagged with
@@ -53,6 +58,12 @@
  *   This mirrors the MDQ pattern the contract object expects -- one line item
  *   per product per segment year -- and lets the contract card render
  *   multi-year subscription segments correctly.
+ *
+ *   Each segment year's unit price is uplifted compoundingly from Y1 (e.g.
+ *   with upliftPct=7 and unitPrice=18000 → Y1=18000, Y2=19260, Y3=20608).
+ *   This exercises the last-segment-ARR renewal forecast logic in
+ *   workflow-create-contract-from-deal.js so the auto-spawned renewal deal
+ *   reflects post-uplift pricing rather than Y1 pricing.
  *   6) Output fields:
  *        - success (string)
  *        - companyId (string)
@@ -60,6 +71,12 @@
  *        - lineItemIds (string)       : comma-separated
  *        - lineItemsCreated (number)
  *        - dealAmount (number)
+ *        - dealTotalTcv (number)      : matches dealAmount; mirrors the
+ *                                       total_tcv stamped on the deal
+ *        - dealYear1Arr (number)      : sum of Year-1 recurring line items
+ *                                       (post-uplift, post-discount)
+ *        - upliftPct (number)         : annual uplift applied to multi-year
+ *                                       recurring segments (0 = flat pricing)
  *        - persona (string)           : which persona was used
  *        - seedSource (string)        : the actual seed value used
  *        - errorMessage (string)
@@ -163,6 +180,10 @@ const PERSONAS = [
     productMix: ['LQ'],
     contractMonths: [12, 12],
     discountPct: [0, 5],
+    // Annual uplift % range applied compoundingly to each segment year.
+    // Smaller deals tend to have flatter pricing; enterprise contracts
+    // routinely carry 5-10% annual escalators.
+    upliftPct: [0, 4],
   },
   {
     key: 'midmarket',
@@ -172,6 +193,7 @@ const PERSONAS = [
     productMix: ['LQ', 'FCM'],
     contractMonths: [12, 24],
     discountPct: [0, 10],
+    upliftPct: [3, 7],
   },
   {
     key: 'enterprise',
@@ -181,6 +203,7 @@ const PERSONAS = [
     productMix: ['LQ', 'FCM'],
     contractMonths: [24, 36],
     discountPct: [5, 15],
+    upliftPct: [5, 10],
   },
 ];
 
@@ -368,9 +391,8 @@ const OPTIONAL_LINE_ITEM_PROPS = [
   'end_date',
   'hs_recurring_billing_start_date',
   'hs_recurring_billing_end_date',
-  'hs_recurring_billing_period',
+  'dh_duration',
   'hs_recurring_billing_number_of_payments',
-  'recurringbillingfrequency',
   'revenue_type',
 ];
 
@@ -460,17 +482,20 @@ function buildContactProperties(rng, companyName, companyDomain, areaCode, isPri
 // `hs_recurring_billing_end_date`) AND the simple `start_date` / `end_date`
 // custom properties, so whichever set the portal exposes is populated.
 //
-// CRITICAL: do NOT set `hs_recurring_billing_period` and
-// `hs_recurring_billing_number_of_payments` together. When both are present
-// HubSpot recomputes `hs_recurring_billing_end_date` as
-// `start + period × number_of_payments`, which leaves the persisted end date
-// 1 day past the intended term boundary (e.g. 2027-05-16 instead of
-// 2027-05-15 for a 1-year line that started 2026-05-16). Downstream the
-// contract object's `buildYearSegments` then emits a bogus single-day
-// "Year 2" segment per line item — the exact bug the contract card was
-// surfacing on Apr 30 test contracts.
-function buildLineItemProperties(product, lineStart, lineEnd, segmentYear, totalSegments) {
-  const amount = product.unitPrice * product.quantity;
+// `unitPrice` is the per-year uplifted price (NOT product.unitPrice — that's
+// only the Y1 baseline). buildLineItemPlan computes the uplifted price per
+// segment year so the renewal forecast logic sees post-uplift pricing on
+// the final segment.
+//
+// Recurring vs one-time is signaled exclusively via the DealHub-managed
+// `dh_duration` field (number of months). 0 / blank = one-time. The legacy
+// `hs_recurring_billing_period` + `hs_recurring_billing_number_of_payments`
+// combo is intentionally NOT used here — when both were set HubSpot would
+// recompute `hs_recurring_billing_end_date` 1 day past the intended boundary
+// and produce bogus single-day "Year 2" segments.
+function buildLineItemProperties(product, lineStart, lineEnd, segmentYear, totalSegments, unitPrice) {
+  const resolvedUnitPrice = Number.isFinite(unitPrice) && unitPrice > 0 ? unitPrice : product.unitPrice;
+  const amount = resolvedUnitPrice * product.quantity;
   const isMultiSegment = product.recurring && totalSegments > 1;
   const yearSuffix = isMultiSegment ? ` (Year ${segmentYear} of ${totalSegments})` : '';
   const startStr = fmtDate(lineStart);
@@ -479,8 +504,8 @@ function buildLineItemProperties(product, lineStart, lineEnd, segmentYear, total
     name: `${product.name}${yearSuffix}`,
     hs_sku: product.sku,
     description: `Auto-generated test ${product.name}${yearSuffix}`,
-    quantity: String(product.quantity),
-    price: String(product.unitPrice),
+    dh_quantity: String(product.quantity),
+    price: String(resolvedUnitPrice),
     amount: String(amount),
     hs_line_item_currency_code: 'USD',
     revenue_type: 'new',
@@ -496,23 +521,26 @@ function buildLineItemProperties(product, lineStart, lineEnd, segmentYear, total
     end_date: endStr,
   };
   if (product.recurring) {
-    // Period only — number_of_payments intentionally omitted (see header).
-    props.hs_recurring_billing_period = 'P12M';
+    // 12 months = annual billing cadence. Number of payments intentionally
+    // omitted so HubSpot doesn't recompute the end date.
+    props.dh_duration = '12';
   } else {
-    // Mark one-time charges (Implementation, Onboarding, Setup, etc.)
-    // unambiguously. The contract creation logic uses `recurringbillingfrequency`
-    // and the line item name to filter recurring vs one-time, but the explicit
-    // marker means we don't depend on name-pattern matching.
-    props.recurringbillingfrequency = 'one_time';
+    // One-time charges (Implementation, Onboarding, Setup, etc.) leave
+    // `dh_duration` unset — the contract creation logic interprets a missing
+    // / zero `dh_duration` as a one-time charge and falls back to a
+    // name-pattern heuristic only for legacy line items.
   }
   return props;
 }
 
 // Produces a list of line-item descriptors for the deal. Recurring products
-// are exploded into per-year segments; one-time products produce a single
-// entry dated to the contract start.
-function buildLineItemPlan(products, contractStart, contractEnd, termMonths) {
+// are exploded into per-year segments with compounding annual uplifts, so a
+// 36-month term produces 3 line items per recurring product, each priced
+// `baseUnitPrice × (1 + upliftPct/100) ^ (year - 1)`. One-time products
+// produce a single entry dated to the contract start at the base price.
+function buildLineItemPlan(products, contractStart, contractEnd, termMonths, upliftPct) {
   const totalSegments = Math.max(1, Math.ceil(termMonths / 12));
+  const upliftMultiplier = 1 + (Number(upliftPct) || 0) / 100;
   const plan = [];
   for (const product of products) {
     if (!product.recurring) {
@@ -522,6 +550,7 @@ function buildLineItemPlan(products, contractStart, contractEnd, termMonths) {
         lineEnd: contractStart,
         segmentYear: 1,
         totalSegments: 1,
+        unitPrice: product.unitPrice,
       });
       continue;
     }
@@ -529,12 +558,18 @@ function buildLineItemPlan(products, contractStart, contractEnd, termMonths) {
     for (let year = 1; year <= totalSegments; year++) {
       const naiveSegmentEnd = addDays(addMonths(segmentStart, 12), -1);
       const segmentEnd = naiveSegmentEnd > contractEnd ? new Date(contractEnd) : naiveSegmentEnd;
+      // Compound the uplift from Y1 (year 1 = base price; year N = base × m^(N-1)).
+      // Round to whole dollars so the line items render cleanly.
+      const yearUnitPrice = Math.round(
+        product.unitPrice * Math.pow(upliftMultiplier, year - 1)
+      );
       plan.push({
         product,
         lineStart: new Date(segmentStart),
         lineEnd: new Date(segmentEnd),
         segmentYear: year,
         totalSegments,
+        unitPrice: yearUnitPrice,
       });
       segmentStart = addDays(segmentEnd, 1);
       if (segmentStart > contractEnd) break;
@@ -624,18 +659,44 @@ exports.main = async (event, callback) => {
     const products = [...productMix];
     if (includeOneTime) products.push(PRODUCTS.IMPLEMENTATION);
 
-    const lineItemPlan = buildLineItemPlan(products, contractStart, contractEnd, termMonths);
+    // Uplift % resolution: explicit input wins (including 0 for flat
+    // pricing), otherwise pick deterministically from the persona's range.
+    const upliftPctInput = Number(inputs.upliftPct);
+    const upliftPct = Number.isFinite(upliftPctInput)
+      ? Math.max(0, upliftPctInput)
+      : Math.round(
+          randomFloat(rng, persona.upliftPct[0], persona.upliftPct[1]) * 100
+        ) / 100;
+
+    const lineItemPlan = buildLineItemPlan(products, contractStart, contractEnd, termMonths, upliftPct);
 
     const discountPct = randomFloat(rng, persona.discountPct[0], persona.discountPct[1]);
+    const discountFactor = 1 - discountPct / 100;
     // Recurring products charge per segment year, so the deal amount needs
     // to reflect the full multi-year TCV (one charge per line in the plan).
+    // entry.unitPrice is the post-uplift Y_N price set by buildLineItemPlan.
     const computedAmount = lineItemPlan.reduce(
-      (sum, entry) => sum + (entry.product.unitPrice * entry.product.quantity * (1 - discountPct / 100)),
+      (sum, entry) => sum + (entry.unitPrice * entry.product.quantity * discountFactor),
       0,
     );
     const dealAmount = Number.isFinite(overrideAmount) && overrideAmount > 0
       ? overrideAmount
       : Math.round(computedAmount);
+
+    // year_1_arr = sum of recurring line items in segment year 1 (post-
+    // uplift, post-discount). Mirrors what the contract / renewal helper
+    // expects to see on a new-business deal.
+    const dealYear1Arr = Math.round(
+      lineItemPlan
+        .filter((entry) => entry.product.recurring && entry.segmentYear === 1)
+        .reduce(
+          (sum, entry) => sum + entry.unitPrice * entry.product.quantity * discountFactor,
+          0
+        )
+    );
+    // total_tcv = full deal value across ALL line items (recurring multi-
+    // year + one-time). Equals dealAmount when the override isn't supplied.
+    const dealTotalTcv = Math.round(computedAmount);
 
     // ── Company ──────────────────────────────────────────────────────────
     let companyId;
@@ -688,6 +749,7 @@ exports.main = async (event, callback) => {
         entry.lineEnd,
         entry.segmentYear,
         entry.totalSegments,
+        entry.unitPrice,
       );
       const created = await createLineItem(hs, lineProps);
       const lineItemId = created.id;
@@ -696,6 +758,12 @@ exports.main = async (event, callback) => {
     }
 
     // ── Deal property defaults ───────────────────────────────────────────
+    // total_tcv and year_1_arr are stamped explicitly so DealHub-side
+    // forecasting + the renewal-spawn helper have the values they need
+    // even before HubSpot rolls anything up from line items. The renewal
+    // CCA's createObjectWithFallback drops these gracefully if the
+    // properties haven't been provisioned (run scripts/create-deal-
+    // properties.js to add them).
     const dealUpdates = {};
     if (!dealProps.deal_category) dealUpdates.deal_category = 'new_business';
     if (!dealProps.revenue_type) dealUpdates.revenue_type = 'new';
@@ -705,11 +773,36 @@ exports.main = async (event, callback) => {
     if (!dealProps.amount || Number(dealProps.amount) === 0) {
       dealUpdates.amount = String(dealAmount);
     }
+    dealUpdates.total_tcv = String(dealTotalTcv);
+    dealUpdates.year_1_arr = String(dealYear1Arr);
     if (!dealProps.dealname || /^untitled/i.test(dealProps.dealname)) {
       dealUpdates.dealname = `${companyName} - New Business (Test)`;
     }
     if (Object.keys(dealUpdates).length) {
-      await updateObject(hs, TYPE.DEAL, dealId, dealUpdates);
+      try {
+        await updateObject(hs, TYPE.DEAL, dealId, dealUpdates);
+      } catch (err) {
+        // If the portal hasn't run scripts/create-deal-properties.js yet,
+        // total_tcv / year_1_arr won't exist — strip them and retry so the
+        // rest of the test deal still gets populated.
+        const msg = describeHubSpotError(err).toLowerCase();
+        if (
+          err?.response?.status === 400 &&
+          (msg.includes('total_tcv') || msg.includes('year_1_arr') || msg.includes('property_doesnt_exist'))
+        ) {
+          console.warn(
+            '[populate-test-deal-data] total_tcv/year_1_arr not defined on deals — retrying without. Run scripts/create-deal-properties.js to enable.'
+          );
+          const fallbackUpdates = { ...dealUpdates };
+          delete fallbackUpdates.total_tcv;
+          delete fallbackUpdates.year_1_arr;
+          if (Object.keys(fallbackUpdates).length) {
+            await updateObject(hs, TYPE.DEAL, dealId, fallbackUpdates);
+          }
+        } else {
+          throw err;
+        }
+      }
     }
 
     return callback({
@@ -720,6 +813,9 @@ exports.main = async (event, callback) => {
         lineItemIds: lineItemIds.join(','),
         lineItemsCreated: lineItemIds.length,
         dealAmount,
+        dealTotalTcv,
+        dealYear1Arr,
+        upliftPct,
         persona: persona.key,
         seedSource,
         errorMessage: '',
@@ -736,6 +832,9 @@ exports.main = async (event, callback) => {
         lineItemIds: '',
         lineItemsCreated: 0,
         dealAmount: 0,
+        dealTotalTcv: 0,
+        dealYear1Arr: 0,
+        upliftPct: 0,
         errorMessage: message,
       },
     });
