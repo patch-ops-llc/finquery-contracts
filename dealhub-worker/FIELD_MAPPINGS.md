@@ -33,21 +33,71 @@ DealHub writes these on the deal during quoting. On close-won, the
 contract API copies them to the contract; recurring items also create
 subscription segments.
 
+> **Note:** `dh_quantity`, `dh_duration`, and `product_tag` are DealHub-
+> managed custom properties on `line_items`. `dh_quantity` and `dh_duration`
+> replace the HubSpot-native `quantity` and `hs_recurring_billing_period`
+> fields; `product_tag` is the explicit recurring/one-time classifier that
+> drives subscription segment creation. The HubSpot defaults are no longer
+> read or written by the contract API.
+
 | HubSpot Internal Name | API JSON Path | Type | DealHub | Values / Notes |
 |---|---|---|---|---|
 | `name` | `dealLineItems[].name` | string | **W** | Product display name |
-| `quantity` | `dealLineItems[].quantity` | number | **W** | Integer seats/units |
+| `dh_quantity` | `dealLineItems[].quantity` | number | **W** | Integer seats/units (DealHub custom property) |
 | `price` | `dealLineItems[].unitPrice` | number | **W** | Unit price (per quantity) |
-| `hs_sku` | `dealLineItems[].sku` | string | **W** | Product code: `LQ`, `FCM`, etc. |
+| `hs_sku` | `dealLineItems[].sku` | string | **W** | Product code: `LQ`, `FCM`, etc. The contract API uses the **full SKU** as `product_code` on the resulting segment — distinct SKUs (e.g. `SUB-MO`, `SUB-SU`) stay distinct. |
 | `description` | `dealLineItems[].description` | string | **W** | Optional |
-| `hs_recurring_billing_period` | `dealLineItems[].recurringBillingPeriod` | string | **W** | `P12M` (annual), `P1M` (monthly), `P3M`, `P6M`. **Empty / `one_time` = will NOT create a subscription segment** |
-| `hs_recurring_billing_start_date` | `dealLineItems[].recurringBillingStartDate` | date | **W** | Start date for this line's billing period |
+| `product_tag` | `dealLineItems[].productTag` | enum | **W** | **Primary recurring/one-time signal.** Values: `Recurring` or `One-time`. `Recurring` lines create a subscription segment; `One-time` lines live on the contract as line items only. DealHub custom property. |
+| `dh_duration` | `dealLineItems[].duration` | number | **W** | Number of months (12 = annual, 1 = monthly, 3 = quarterly, 6 = semi-annual). Used as a secondary signal when `product_tag` is unset, and to compute segment span. |
+| `hs_recurring_billing_start_date` | `dealLineItems[].recurringBillingStartDate` | date | **W** | Preferred — start date for this line's billing period. See "Line item date fields" below for alternates. |
+| `hs_recurring_billing_end_date` | `dealLineItems[].recurringBillingEndDate` | date | **W** | Optional — end date for this line's billing period. If omitted, the contract API computes it from `recurringBillingStartDate + dh_duration`. |
+| `start_date` | `dealLineItems[].startDate` | date | **W** | Alternate to `hs_recurring_billing_start_date`. The contract API tries this if the HubSpot-native field isn't set. |
+| `end_date` | `dealLineItems[].endDate` | date | **W** | Alternate to `hs_recurring_billing_end_date`. Same fallback behavior. |
 | `revenue_type` | `dealLineItems[].revenueType` | enum | **W** | Per-line: `new`, `renewal`, `expansion`, `contraction`, `cross_sell` — set on each line item |
 
 > **Critical:** `revenue_type` is set **per line item**, not per deal. A
 > single amendment can mix `expansion`, `contraction`, and `cross_sell`
 > lines. The contract API reads each line's tag to set the corresponding
 > subscription segment's `amendment_indicator`.
+
+### Line item date fields — what the contract API reads
+
+The contract API resolves each line item's `[start, end]` span using this
+priority order. DealHub can populate either the HubSpot-native fields, the
+simple `start_date` / `end_date` custom fields, or a mix — whichever is
+present wins.
+
+| Priority | Start source | End source |
+|---|---|---|
+| 1 | `hs_recurring_billing_start_date` | `hs_recurring_billing_end_date` |
+| 2 | `start_date` | `end_date` |
+| 3 | (start required) | `start + dh_duration months − 1 day` (when `dh_duration` is set without a payments count — typical MDQ-style payload) |
+| 4 | (start required) | `start + (number_of_payments × dh_duration) − 1 day` (when both are set) |
+| 5 | Deal `contract_start_date` (last-resort fallback) | Deal `contract_end_date` (last-resort fallback) |
+
+If none of priorities 1–4 produce a usable span, the line collapses to the
+deal-level contract dates — that's the failure mode that makes every
+segment look identical. **Always populate at least one of priorities 1–3.**
+
+### MDQ-style payloads are supported
+
+DealHub may send recurring products as either:
+
+- **One line item per product spanning the full multi-year term**
+  (e.g. `LQ Advanced Module`, `start_date = 2026-05-01`,
+  `end_date = 2029-04-30`, `dh_duration = 12`). The contract API splits
+  this into N annual segments anchored on the line's start.
+
+- **One line item per product per segment year (MDQ-style)**
+  (e.g. `LQ Advanced Module Y1`, `start_date = 2026-05-01`,
+  `end_date = 2027-04-30`; `LQ Advanced Module Y2`,
+  `start_date = 2027-05-01`, `end_date = 2028-04-30`; …). The contract API
+  produces one segment per line and sets `segment_year` from the segment's
+  start date relative to the **contract** start (not the line's own span).
+
+Either pattern produces the same final shape on the contract — N segments
+with `segment_year = 1, 2, 3 …` based on contract anchoring. Mixed payloads
+(some products multi-year, others MDQ-style) work too.
 
 ---
 

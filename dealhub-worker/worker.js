@@ -504,7 +504,7 @@ function isInheritable(seg) {
 //   1. Filter to inheritable segments (active/future, or running with no status)
 //   2. One per product (highest segment_year wins inside the period)
 //   3. Compute unit_price from arr/quantity if missing
-//   4. Map billing_frequency -> hs_recurring_billing_period (P12M, P1M, ...)
+//   4. Map billing_frequency -> dh_duration (months: 12, 1, 3, 6)
 //
 // DealHub takes this array and uses it as the seed for their renewal proposal.
 function buildRenewalLineItems(period) {
@@ -551,7 +551,8 @@ function buildRenewalLineItems(period) {
       lineAmount: round2(unitPrice * quantity),
       currency: 'USD',
       billingFrequency: seg.billingFrequency || 'annual',
-      recurringBillingPeriod: billingFrequencyToPeriod(seg.billingFrequency),
+      duration: billingFrequencyToMonths(seg.billingFrequency),
+      productTag: 'Recurring',
       revenueType: 'renewal',
       sourceArr: round2(arr),
       sourceMrr: round2(mrr),
@@ -561,13 +562,13 @@ function buildRenewalLineItems(period) {
   });
 }
 
-function billingFrequencyToPeriod(billingFrequency) {
+function billingFrequencyToMonths(billingFrequency) {
   const v = String(billingFrequency || '').toLowerCase();
-  if (v === 'monthly') return 'P1M';
-  if (v === 'quarterly') return 'P3M';
-  if (v === 'semiannual' || v === 'semi-annual' || v === 'semi_annual') return 'P6M';
-  if (v === 'annual' || v === 'yearly' || v === '') return 'P12M';
-  return 'P12M';
+  if (v === 'monthly') return 1;
+  if (v === 'quarterly') return 3;
+  if (v === 'semiannual' || v === 'semi-annual' || v === 'semi_annual') return 6;
+  if (v === 'annual' || v === 'yearly' || v === '') return 12;
+  return 12;
 }
 
 // ── Deal line items ───────────────────────────────────────────────────────
@@ -577,25 +578,37 @@ async function loadDealLineItems(hs, dealId) {
   if (ids.length === 0) return [];
   const fetched = await Promise.all(
     ids.map((id) => getObject(hs, 'line_items', id, [
-      'name', 'description', 'quantity', 'price', 'amount', 'hs_sku',
-      'hs_recurring_billing_period', 'hs_recurring_billing_start_date',
+      'name', 'description', 'dh_quantity', 'price', 'amount', 'hs_sku',
+      'dh_duration', 'product_tag', 'hs_recurring_billing_start_date',
       'revenue_type',
     ]).catch(() => null))
   );
   return fetched.filter(Boolean).map((li) => {
     const p = li.properties || {};
+    const durationMonths = numOrNull(p.dh_duration);
+    const productTag = String(p.product_tag || '').trim();
+    const tagLower = productTag.toLowerCase().replace(/[\s_]+/g, '-');
+    let isRecurring;
+    if (tagLower === 'recurring' || tagLower === 'subscription') {
+      isRecurring = true;
+    } else if (tagLower === 'one-time' || tagLower === 'onetime' || tagLower === 'ad-hoc' || tagLower === 'adhoc') {
+      isRecurring = false;
+    } else {
+      isRecurring = durationMonths !== null && durationMonths > 0;
+    }
     return {
       id: li.id,
       name: p.name || null,
       sku: p.hs_sku || null,
       description: p.description || null,
-      quantity: numOrNull(p.quantity),
+      quantity: numOrNull(p.dh_quantity),
       unitPrice: numOrNull(p.price),
       amount: numOrNull(p.amount),
-      recurringBillingPeriod: p.hs_recurring_billing_period || null,
+      duration: durationMonths,
+      productTag: productTag || null,
       recurringBillingStartDate: p.hs_recurring_billing_start_date || null,
       revenueType: p.revenue_type || null,
-      isRecurring: !!p.hs_recurring_billing_period && p.hs_recurring_billing_period.toLowerCase() !== 'one_time',
+      isRecurring,
     };
   });
 }

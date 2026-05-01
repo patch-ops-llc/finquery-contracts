@@ -798,11 +798,28 @@ function parseDhDuration(value) {
   return Math.round(n);
 }
 
+// `product_tag` is the DealHub-managed enum on line items that explicitly
+// declares whether a line is "Recurring" (creates a subscription segment) or
+// "One-time" (lives on the contract as a line item only). It is the primary
+// signal for recurring vs one-time classification. dh_duration / hs_arr / the
+// name heuristic remain as fallbacks for legacy imports and manually-created
+// line items where product_tag was never set.
+//
+// Returns 'recurring' | 'one_time' | null.
+function parseProductTag(value) {
+  if (value === null || value === undefined) return null;
+  const v = String(value).trim().toLowerCase().replace(/[\s_]+/g, '-');
+  if (!v) return null;
+  if (v === 'recurring' || v === 'subscription') return 'recurring';
+  if (v === 'one-time' || v === 'onetime' || v === 'one' || v === 'ad-hoc' || v === 'adhoc') return 'one_time';
+  return null;
+}
+
 // DealHub-managed line items frequently omit dh_duration, so we use a
 // multi-signal check and fall back to a name-based one-time heuristic
 // (setup / onboarding / training / etc). Default for SaaS line items is
-// RECURRING — an explicit `dh_duration` of 0 or matching one-time names
-// flip the result.
+// RECURRING — `product_tag = One-time`, an explicit `dh_duration` of 0, or
+// matching one-time names flip the result.
 //
 // Hoisted to module scope so /api/load-contract (which needs to surface
 // one-time implementation/onboarding line items in the UI) and
@@ -812,6 +829,13 @@ const ONE_TIME_NAME_PATTERN =
 
 function isRecurringLineItem(li) {
   const lp = (li && li.properties) || {};
+
+  // Primary signal — DealHub-managed `product_tag` enum ("Recurring" / "One-time").
+  const tag = parseProductTag(lp.product_tag);
+  if (tag === 'recurring') return true;
+  if (tag === 'one_time') return false;
+
+  // Secondary signal — DealHub-managed `dh_duration` (months). 0 / blank = one-time.
   const durationRaw = lp.dh_duration;
   const durationStr = String(durationRaw == null ? '' : durationRaw).trim();
   if (durationStr !== '') {
@@ -819,8 +843,8 @@ function isRecurringLineItem(li) {
     return months !== null;
   }
 
-  // Fallback signals for line items where dh_duration was never set
-  // (legacy imports, manually-created line items, etc.)
+  // Fallback signals for line items where neither product_tag nor dh_duration
+  // was set (legacy imports, manually-created line items, etc.)
   if (Number(lp.hs_arr || 0) > 0) return true;
   if (Number(lp.hs_mrr || 0) > 0) return true;
   if (Number(lp.hs_acv || 0) > 0) return true;
@@ -1485,6 +1509,7 @@ async function syncContractRecurringLineItemsToDeal(contractId, dealId, options 
               hs_sku: p.product_code || '',
               description: '',
               dh_duration: String(billingFrequencyToMonths(p.billing_frequency)),
+              product_tag: 'Recurring',
               revenue_type: p.revenue_type || fallbackRevenueType,
             },
           };
@@ -1515,15 +1540,12 @@ async function syncContractRecurringLineItemsToDeal(contractId, dealId, options 
         sourceLineItemIds.map((id) =>
           getObject('line_items', id, [
             'name', 'dh_quantity', 'price', 'hs_sku', 'description',
-            'dh_duration', 'revenue_type',
+            'dh_duration', 'product_tag', 'revenue_type',
           ])
         )
       );
 
-    recurringSourceItems = sourceItems.filter((item) => {
-      const months = parseDhDuration(item?.properties?.dh_duration);
-      return months !== null;
-    });
+    recurringSourceItems = sourceItems.filter(isRecurringLineItem);
 
     if (recurringSourceItems.length > 0) {
       warnings.push(`Used ${recurringSourceItems.length} recurring contract line items as fallback`);
@@ -1630,6 +1652,7 @@ async function syncContractRecurringLineItemsToDeal(contractId, dealId, options 
       hs_sku: item.sku || '',
       description: buildInheritedProductDescription(item.name, item.key),
       dh_duration: String(item.durationMonths || 12),
+      product_tag: 'Recurring',
       revenue_type: item.hasExpansion ? 'expansion' : normalizeLineRevenueType('', fallbackRevenueType),
     };
     if (lineStartDate) lineProps.hs_recurring_billing_start_date = lineStartDate;
@@ -1900,7 +1923,7 @@ app.get('/api/load-contract', async (req, res) => {
           lineItemIds.map((id) =>
             getObject('line_items', id, [
               'name', 'dh_quantity', 'price', 'amount', 'hs_sku', 'description',
-              'hs_line_item_currency_code', 'dh_duration',
+              'hs_line_item_currency_code', 'dh_duration', 'product_tag',
               'hs_recurring_billing_start_date', 'hs_recurring_billing_end_date',
               'hs_recurring_billing_number_of_payments', 'hs_recurring_billing_terms',
               'hs_acv', 'hs_arr', 'hs_mrr',
@@ -3214,6 +3237,7 @@ app.post('/api/upsert-demo-line-items', async (req, res) => {
           'dh_quantity',
           'hs_sku',
           'dh_duration',
+          'product_tag',
           'hs_recurring_billing_start_date',
           'revenue_type',
         ]);
@@ -3242,6 +3266,7 @@ app.post('/api/upsert-demo-line-items', async (req, res) => {
         price: toPriceString(unitPrice),
         hs_sku: item.productCode || `DEMO-${item.key.toUpperCase()}`,
         dh_duration: '12',
+        product_tag: 'Recurring',
         description: `FinQuery CPQ demo line item | FQ_DEMO_PRODUCT_KEY:${item.key}${item.year ? ` | FQ_DEMO_YEAR:${item.year}` : ''}`,
         revenue_type: item.revenueType,
       };
@@ -3330,7 +3355,7 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
         lineItemIds.map((id) =>
           getObject('line_items', id, [
             'name', 'dh_quantity', 'price', 'amount', 'hs_sku', 'description',
-            'hs_line_item_currency_code', 'dh_duration',
+            'hs_line_item_currency_code', 'dh_duration', 'product_tag',
             'hs_recurring_billing_start_date', 'hs_recurring_billing_end_date',
             'hs_recurring_billing_number_of_payments', 'hs_recurring_billing_terms',
             'hs_acv', 'hs_arr', 'hs_mrr',
@@ -3508,6 +3533,7 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
             description: lp.description || '',
             hs_line_item_currency_code: lp.hs_line_item_currency_code || '',
             dh_duration: lp.dh_duration || '',
+            product_tag: lp.product_tag || (recurring ? 'Recurring' : 'One-time'),
             hs_recurring_billing_start_date: span.startDate || lp.hs_recurring_billing_start_date || '',
             hs_recurring_billing_end_date: span.endDate || lp.hs_recurring_billing_end_date || '',
             hs_recurring_billing_number_of_payments: lp.hs_recurring_billing_number_of_payments || '',

@@ -164,9 +164,11 @@ seeding logic in the existing Railway API):
 5. Compute `unitPrice`:
    - Use `segment.unitPrice` if set (>0)
    - Otherwise `arr / quantity` (annualized for monthly segments via `mrr * 12`)
-6. Map `billingFrequency` to HubSpot's `recurringBillingPeriod`:
-   `monthly→P1M`, `quarterly→P3M`, `semiannual→P6M`, `annual→P12M` (default).
-7. Tag every line as `revenueType: "renewal"`. DealHub can override per line
+6. Map `billingFrequency` to `dh_duration` (months):
+   `monthly→1`, `quarterly→3`, `semiannual→6`, `annual→12` (default).
+7. Stamp `productTag: "Recurring"` on every renewal line — these always seed
+   subscription segments on close-won.
+8. Tag every line as `revenueType: "renewal"`. DealHub can override per line
    based on its own product-family logic before writing back to the deal.
 
 Each renewal line carries `sourceSegmentId`, `sourceSegmentYear`, and
@@ -320,7 +322,7 @@ curl "$WORKER/v1/deals/123456789"
       "lineAmount": 90000,
       "currency": "USD",
       "billingFrequency": "annual",
-      "recurringBillingPeriod": "P12M",
+      "duration": 12,
       "revenueType": "renewal",
       "sourceArr": 90000,
       "sourceMrr": 7500,
@@ -337,7 +339,7 @@ curl "$WORKER/v1/deals/123456789"
       "lineAmount": 30000,
       "currency": "USD",
       "billingFrequency": "annual",
-      "recurringBillingPeriod": "P12M",
+      "duration": 12,
       "revenueType": "renewal",
       "sourceArr": 30000,
       "sourceMrr": 2500,
@@ -550,12 +552,13 @@ type RenewalLineItem = {
   productCode: string | null;
   productName: string;
   sku: string | null;                  // = productCode (the value to write to hs_sku)
-  quantity: number;
+  quantity: number;                    // value to write to dh_quantity
   unitPrice: number;                   // dollars, 2dp
   lineAmount: number;                  // quantity * unitPrice
   currency: 'USD';
   billingFrequency: 'annual' | 'monthly' | 'quarterly' | 'semiannual' | string;
-  recurringBillingPeriod: 'P12M' | 'P1M' | 'P3M' | 'P6M' | string;  // value to write to hs_recurring_billing_period
+  duration: 12 | 1 | 3 | 6 | number;   // number of months — value to write to dh_duration
+  productTag: 'Recurring';             // value to write to product_tag (always Recurring on renewal seeds)
   revenueType: 'renewal';              // override per-line in DealHub before writing
   sourceArr: number;                   // ARR of the source segment
   sourceMrr: number;                   // MRR of the source segment
@@ -600,13 +603,14 @@ type DealLineItem = {
   name: string | null;
   sku: string | null;
   description: string | null;
-  quantity: number | null;
+  quantity: number | null;             // sourced from dh_quantity
   unitPrice: number | null;
   amount: number | null;
-  recurringBillingPeriod: string | null;
+  duration: number | null;             // months — sourced from dh_duration
+  productTag: 'Recurring' | 'One-time' | string | null; // sourced from product_tag — primary recurring/one-time signal
   recurringBillingStartDate: string | null;
   revenueType: string | null;
-  isRecurring: boolean;                // false = one-time charge
+  isRecurring: boolean;                // resolved from productTag (preferred), then duration; false = one-time charge
 };
 ```
 

@@ -392,6 +392,7 @@ const OPTIONAL_LINE_ITEM_PROPS = [
   'hs_recurring_billing_start_date',
   'hs_recurring_billing_end_date',
   'dh_duration',
+  'product_tag',
   'hs_recurring_billing_number_of_payments',
   'revenue_type',
 ];
@@ -487,12 +488,13 @@ function buildContactProperties(rng, companyName, companyDomain, areaCode, isPri
 // segment year so the renewal forecast logic sees post-uplift pricing on
 // the final segment.
 //
-// Recurring vs one-time is signaled exclusively via the DealHub-managed
-// `dh_duration` field (number of months). 0 / blank = one-time. The legacy
-// `hs_recurring_billing_period` + `hs_recurring_billing_number_of_payments`
-// combo is intentionally NOT used here — when both were set HubSpot would
-// recompute `hs_recurring_billing_end_date` 1 day past the intended boundary
-// and produce bogus single-day "Year 2" segments.
+// Recurring vs one-time is signaled by the DealHub-managed `product_tag`
+// enum ("Recurring" / "One-time") with `dh_duration` (number of months) as
+// a secondary signal. The legacy `hs_recurring_billing_period` +
+// `hs_recurring_billing_number_of_payments` combo is intentionally NOT
+// used here — when both were set HubSpot would recompute
+// `hs_recurring_billing_end_date` 1 day past the intended boundary and
+// produce bogus single-day "Year 2" segments.
 function buildLineItemProperties(product, lineStart, lineEnd, segmentYear, totalSegments, unitPrice) {
   const resolvedUnitPrice = Number.isFinite(unitPrice) && unitPrice > 0 ? unitPrice : product.unitPrice;
   const amount = resolvedUnitPrice * product.quantity;
@@ -524,11 +526,12 @@ function buildLineItemProperties(product, lineStart, lineEnd, segmentYear, total
     // 12 months = annual billing cadence. Number of payments intentionally
     // omitted so HubSpot doesn't recompute the end date.
     props.dh_duration = '12';
+    props.product_tag = 'Recurring';
   } else {
     // One-time charges (Implementation, Onboarding, Setup, etc.) leave
-    // `dh_duration` unset — the contract creation logic interprets a missing
-    // / zero `dh_duration` as a one-time charge and falls back to a
-    // name-pattern heuristic only for legacy line items.
+    // `dh_duration` unset and tag the line as `One-time` so the contract
+    // creation logic doesn't have to fall back to name-pattern heuristics.
+    props.product_tag = 'One-time';
   }
   return props;
 }

@@ -87,6 +87,7 @@ const LINE_ITEM_PROPS = [
   'hs_sku',
   'hs_line_item_currency_code',
   'dh_duration',
+  'product_tag',
   'hs_recurring_billing_start_date',
   'hs_recurring_billing_end_date',
   'hs_recurring_billing_number_of_payments',
@@ -114,6 +115,7 @@ const CONTRACT_LINE_ITEM_PROPS = [
   'hs_sku',
   'hs_line_item_currency_code',
   'dh_duration',
+  'product_tag',
   'hs_recurring_billing_start_date',
   'hs_recurring_billing_end_date',
   'hs_recurring_billing_number_of_payments',
@@ -125,12 +127,22 @@ const CONTRACT_LINE_ITEM_PROPS = [
   'revenue_type',
 ];
 
-// Common one-time charges. DealHub-managed line items use the custom
-// `dh_duration` field (number of months — 0 / blank means one-time), but we
-// also fall back to a name-based heuristic for items where dh_duration was
-// never set (legacy imports, manually-created line items, etc.).
+// Common one-time charges. DealHub-managed line items use the `product_tag`
+// enum ("Recurring" / "One-time") as the primary signal, with `dh_duration`
+// (months — 0 / blank means one-time) as the secondary signal, and a name-
+// based heuristic as a final fallback for legacy / manually-created lines.
 const ONE_TIME_NAME_PATTERN =
   /\b(setup|set[\s-]?up|onboarding|on[\s-]?boarding|implementation|installation|kick[\s-]?off|training|provisioning|one[\s-]?time|ad[\s-]?hoc|professional services)\b/i;
+
+// Returns 'recurring' | 'one_time' | null. See server.js parseProductTag.
+function parseProductTag(value) {
+  if (value === null || value === undefined) return null;
+  const v = String(value).trim().toLowerCase().replace(/[\s_]+/g, '-');
+  if (!v) return null;
+  if (v === 'recurring' || v === 'subscription') return 'recurring';
+  if (v === 'one-time' || v === 'onetime' || v === 'one' || v === 'ad-hoc' || v === 'adhoc') return 'one_time';
+  return null;
+}
 
 // Minimum contract properties this workflow needs to write. We self-heal any
 // missing ones on the contract schema before creating the record so the
@@ -388,15 +400,20 @@ function computeContractYear(segmentStartStr, contractStartStr) {
 function isRecurringLineItem(lineItem) {
   const props = lineItem?.properties || {};
 
-  // Primary signal — DealHub-managed `dh_duration` (months). 0 / blank = one-time.
+  // Primary signal — DealHub-managed `product_tag` enum ("Recurring" / "One-time").
+  const tag = parseProductTag(props.product_tag);
+  if (tag === 'recurring') return true;
+  if (tag === 'one_time') return false;
+
+  // Secondary signal — DealHub-managed `dh_duration` (months). 0 / blank = one-time.
   const durationRaw = props.dh_duration;
   const durationStr = String(durationRaw == null ? '' : durationRaw).trim();
   if (durationStr !== '') {
     return parseDhDuration(durationStr) !== null;
   }
 
-  // Fallback signals for line items where dh_duration was never set
-  // (legacy imports, manually-created line items, etc.)
+  // Fallback signals for line items where neither product_tag nor dh_duration
+  // was set (legacy imports, manually-created line items, etc.)
   if (Number(props.hs_arr || 0) > 0) return true;
   if (Number(props.hs_mrr || 0) > 0) return true;
   if (Number(props.hs_acv || 0) > 0) return true;
@@ -1183,6 +1200,7 @@ exports.main = async (event, callback) => {
       const contractLineInputs = lineItems.map((li) => {
         const lp = li.properties || {};
         const span = resolveLineItemSpan(li, derivedStartDate, derivedEndDate);
+        const recurring = isRecurringLineItem(li);
         const propsRaw = {
           name: lp.name || 'Product',
           description: lp.description || '',
@@ -1192,6 +1210,7 @@ exports.main = async (event, callback) => {
           hs_sku: lp.hs_sku || '',
           hs_line_item_currency_code: lp.hs_line_item_currency_code || '',
           dh_duration: lp.dh_duration || '',
+          product_tag: lp.product_tag || (recurring ? 'Recurring' : 'One-time'),
           hs_recurring_billing_start_date: span.startDate || lp.hs_recurring_billing_start_date || '',
           hs_recurring_billing_end_date: span.endDate || lp.hs_recurring_billing_end_date || '',
           hs_recurring_billing_number_of_payments: lp.hs_recurring_billing_number_of_payments || '',
