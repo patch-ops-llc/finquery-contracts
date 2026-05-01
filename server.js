@@ -88,10 +88,46 @@ hs.interceptors.response.use(
 );
 
 // ── Product Registry ─────────────────────────────────────────────────────────
-const PRODUCT_REGISTRY = {
-  LQ:  { code: 'LQ',  name: 'LeaseQuery',                category: 'core', arrField: 'lq_arr' },
-  FCM: { code: 'FCM', name: 'FinQuery Contract Management', category: 'core', arrField: 'fcm_arr' },
+// The registry is now DATA-DRIVEN — built from actual subscription segments
+// (and, when relevant, from the deal's recurring line items) at request time
+// rather than hardcoded. Previously this exposed every contract to a static
+// `{ LQ, FCM }` map which surfaced FinQuery Contract Management on contracts
+// that don't sell FCM and won't generalize as new products are added through
+// acquisitions. The shape returned to the card is the same as before:
+//   { CODE: { code, name, category, arrField } }
+// but `arrField` is only populated for the legacy LQ / FCM rollups (which
+// remain as contract-object properties for DealHub-side queries). New product
+// codes carry `arrField = null`; the card derives per-product ARR from
+// segment data directly.
+const LEGACY_ARR_FIELD_BY_CODE = {
+  LQ: 'lq_arr',
+  FCM: 'fcm_arr',
 };
+
+function buildProductRegistry(sources = []) {
+  // Accept either an array of subscriptions / line items, or an object with
+  // { subscriptions, lineItems } so callers can mix both signals.
+  const subs = Array.isArray(sources)
+    ? sources
+    : (sources?.subscriptions || []).concat(sources?.lineItems || []);
+  const out = {};
+  for (const item of subs) {
+    const props = item?.properties || {};
+    const code = String(props.product_code || props.hs_sku || '').trim().toUpperCase();
+    if (!code) continue;
+    if (!out[code]) {
+      out[code] = {
+        code,
+        name: props.product_name || props.name || code,
+        category: 'core',
+        arrField: LEGACY_ARR_FIELD_BY_CODE[code] || null,
+      };
+    } else if (!out[code].name && (props.product_name || props.name)) {
+      out[code].name = props.product_name || props.name;
+    }
+  }
+  return out;
+}
 
 // Prevent slow card loads on contracts with very large deal histories.
 const CARD_DEAL_LOAD_LIMIT = 10;
@@ -988,6 +1024,37 @@ function toMidnight(value) {
   return d;
 }
 
+// Extract [year, month0, day] from a date input. Prefers the YYYY-MM-DD prefix
+// of an ISO string when present (avoids timezone-shift bugs where e.g.
+// '2026-04-30T19:00:00Z' is the same calendar date as '2026-05-01' in CDT but
+// getUTCDate() returns 30, putting the contract anchor a day before the line
+// items and shifting every segment's year stamp by one). Falls back to UTC
+// date methods for plain epoch ms values.
+function parseYearMonthDay(value) {
+  if (!value && value !== 0) return null;
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) return null;
+    return [value.getUTCFullYear(), value.getUTCMonth(), value.getUTCDate()];
+  }
+  const str = String(value).trim();
+  if (!str) return null;
+  const ymd = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (ymd) {
+    return [Number(ymd[1]), Number(ymd[2]) - 1, Number(ymd[3])];
+  }
+  if (/^\d+$/.test(str)) {
+    const d = new Date(Number(str));
+    if (!Number.isNaN(d.getTime())) {
+      return [d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()];
+    }
+  }
+  const d = new Date(str);
+  if (!Number.isNaN(d.getTime())) {
+    return [d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()];
+  }
+  return null;
+}
+
 // Returns the 1-indexed contract year that contains `segmentStart`, anchored
 // on the contract's own start date. e.g. a contract starting 2026-05-01 puts
 // segments starting 2026-05-01..2027-04-30 in Year 1, 2027-05-01..2028-04-30
@@ -999,12 +1066,12 @@ function toMidnight(value) {
 // contract-anchored year stamped, the contract card's useSegmentYearBucketing
 // path works on the first read. Mirrors the card's computeContractYearForDate.
 function computeContractYear(segmentStartStr, contractStartStr) {
-  const segStart = parseDateValue(segmentStartStr);
-  const contractStart = parseDateValue(contractStartStr);
-  if (!segStart || !contractStart) return null;
-  const yearsDiff = segStart.getFullYear() - contractStart.getFullYear();
-  const monthsDiff = segStart.getMonth() - contractStart.getMonth();
-  const daysDiff = segStart.getDate() - contractStart.getDate();
+  const seg = parseYearMonthDay(segmentStartStr);
+  const con = parseYearMonthDay(contractStartStr);
+  if (!seg || !con) return null;
+  const yearsDiff = seg[0] - con[0];
+  const monthsDiff = seg[1] - con[1];
+  const daysDiff = seg[2] - con[2];
   let totalMonths = yearsDiff * 12 + monthsDiff;
   if (daysDiff < 0) totalMonths -= 1;
   const year = Math.floor(totalMonths / 12) + 1;
@@ -1788,7 +1855,10 @@ async function ensureSetup() {
   return {
     contractTypeId,
     subscriptionTypeId,
-    productRegistry: PRODUCT_REGISTRY,
+    // ensureSetup has no contract context — return an empty registry. The
+    // card hydrates the populated registry once load-contract / load-deal-cpq
+    // resolves with actual subscription data.
+    productRegistry: {},
     superAdminEmails: SUPER_ADMIN_EMAILS,
   };
 }
@@ -2036,7 +2106,10 @@ app.get('/api/load-contract', async (req, res) => {
       dealsMeta,
       contacts,
       portalId,
-      productRegistry: PRODUCT_REGISTRY,
+      productRegistry: buildProductRegistry({
+        subscriptions,
+        lineItems: oneTimeLineItems || [],
+      }),
       superAdminEmails: SUPER_ADMIN_EMAILS,
     });
   } catch (e) {
@@ -3120,7 +3193,7 @@ app.get('/api/load-deal-cpq', async (req, res) => {
       company,
       contacts,
       portalId,
-      productRegistry: PRODUCT_REGISTRY,
+      productRegistry: buildProductRegistry(subscriptions),
       superAdminEmails: SUPER_ADMIN_EMAILS,
       isClosedWon,
     });
@@ -3347,6 +3420,68 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
       return results;
     };
 
+    // ── Helper: derive [start, end] from line items ──────────────────
+    // Returns the earliest start_date and latest end_date across all line
+    // items. Used to anchor the contract on the actual line items when the
+    // deal-level contract_start_date / contract_end_date is missing or
+    // disagrees with the line items by more than 30 days. Without this,
+    // segment_year stamps can land off-by-one when DealHub doesn't set the
+    // deal-level dates and we fall through to today / closedate.
+    function resolveDatesFromLineItems(lineItems) {
+      const starts = [];
+      const ends = [];
+      for (const li of lineItems || []) {
+        const span = resolveLineItemSpan(li, null, null);
+        const s = parseDateValue(span.startDate);
+        const e = parseDateValue(span.endDate);
+        if (s) starts.push(s);
+        if (e) ends.push(e);
+      }
+      starts.sort((a, b) => a - b);
+      ends.sort((a, b) => a - b);
+      return {
+        earliestStart: starts[0] ? fmtDateForHS(starts[0]) : null,
+        latestEnd: ends.length ? fmtDateForHS(ends[ends.length - 1]) : null,
+      };
+    }
+
+    function datesAgreeWithinDays(aStr, bStr, days) {
+      const a = parseDateValue(aStr);
+      const b = parseDateValue(bStr);
+      if (!a || !b) return false;
+      return Math.abs(a - b) <= days * 86400000;
+    }
+
+    // Reconciles deal-level contract_start_date / contract_end_date with the
+    // earliest / latest line item dates. Line items are AUTHORITATIVE for the
+    // actual billing schedule — DealHub frequently sets the deal-level
+    // contract_end_date one day past the boundary (e.g. 5/1/2029 instead of
+    // 4/30/2029 for a 3-year contract starting 5/1/2026), which causes the
+    // contract record's `enddate` to be wrong, the renewal preview to be
+    // off-by-one, and a buildYearSegments tail-stub to leak into the year
+    // breakdown ("may 1 → may 1" 1-day "Year N+1"). When line items are
+    // present we trust their boundaries unconditionally; the deal-level
+    // dates are only used when no line items are available.
+    function reconcileContractDates(dealStart, dealEnd, lineItems) {
+      const dealStartNorm = dealStart
+        ? fmtDateForHS(parseDateValue(dealStart))
+        : null;
+      const dealEndNorm = dealEnd ? fmtDateForHS(parseDateValue(dealEnd)) : null;
+      const { earliestStart, latestEnd } = resolveDatesFromLineItems(lineItems);
+      const startDate =
+        earliestStart ||
+        dealStartNorm ||
+        fmtDateForHS(new Date());
+      let endDate = latestEnd || dealEndNorm;
+      if (!endDate) {
+        const ed = parseDateValue(startDate) || new Date();
+        ed.setUTCFullYear(ed.getUTCFullYear() + 1);
+        ed.setUTCDate(ed.getUTCDate() - 1);
+        endDate = fmtDateForHS(ed);
+      }
+      return { startDate, endDate };
+    }
+
     // ── Helper: read deal line items ─────────────────────────────────
     async function getDealLineItems() {
       const lineItemIds = await getAssociatedIds('0-3', dealId, 'line_items');
@@ -3354,7 +3489,12 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
       const items = await Promise.all(
         lineItemIds.map((id) =>
           getObject('line_items', id, [
-            'name', 'dh_quantity', 'price', 'amount', 'hs_sku', 'description',
+            // `dh_quantity` is the DealHub-managed seat / unit count. `quantity`
+            // is the HubSpot-native field; DealHub sets this to `dh_quantity ×
+            // dh_duration` for monthly-priced products and to plain seats for
+            // annually-priced products. We need both to compute annual ARR
+            // correctly across pricing conventions.
+            'name', 'dh_quantity', 'quantity', 'price', 'amount', 'hs_sku', 'description',
             'hs_line_item_currency_code', 'dh_duration', 'product_tag',
             'hs_recurring_billing_start_date', 'hs_recurring_billing_end_date',
             'hs_recurring_billing_number_of_payments', 'hs_recurring_billing_terms',
@@ -3398,9 +3538,24 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
 
       for (const [liIndex, li] of recurringItems.entries()) {
         const lp = li.properties || {};
+        // Display quantity = DealHub's seat / unit count.
         const qty = parseInt(lp.dh_quantity) || 1;
         const unitPrice = parseFloat(lp.price) || 0;
-        const annualArr = unitPrice * qty;
+        // Annual ARR — see getLineItemAnnualArr in the workflow CCA. DealHub
+        // sets HubSpot-native `quantity` to seats × months for monthly-priced
+        // products, so `dh_quantity × price` underreports by the duration
+        // multiplier for any monthly line. Prefer `amount` (= price ×
+        // quantity), then `quantity × price`, then `dh_quantity × price`.
+        const lineAmount = Number(lp.amount || 0);
+        const hsQuantity = Number(lp.quantity || 0);
+        let annualArr;
+        if (Number.isFinite(lineAmount) && lineAmount > 0) {
+          annualArr = lineAmount;
+        } else if (Number.isFinite(hsQuantity) && hsQuantity > 0 && unitPrice > 0) {
+          annualArr = unitPrice * hsQuantity;
+        } else {
+          annualArr = unitPrice * qty;
+        }
         const productName = String(lp.name || 'Product').trim() || 'Product';
         const productCode = deriveProductCode(lp);
         const lineRevType = normalizeLineRevenueType(lp.revenue_type, revenueType || '');
@@ -3565,15 +3720,16 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
     // ═══ NEW BUSINESS ═══════════════════════════════════════════════════
     if (contractIds.length === 0 && category === 'new_business') {
       const companyIds = await getAssociatedIds('0-3', dealId, '0-2');
-      const startDate = dp.contract_start_date || fmtDateForHS(new Date());
-      let endDate = dp.contract_end_date;
-      if (!endDate) {
-        const ed = new Date(startDate);
-        ed.setFullYear(ed.getFullYear() + 1);
-        endDate = fmtDateForHS(ed);
-      }
-
       const lineItems = await getDealLineItems();
+      // Anchor the contract on the actual line items when the deal-level
+      // dates are missing or off (see reconcileContractDates). Without this,
+      // segment_year stamps land off-by-one whenever DealHub doesn't write
+      // contract_start_date and we fall back to today / closedate.
+      const { startDate, endDate } = reconcileContractDates(
+        dp.contract_start_date,
+        dp.contract_end_date,
+        lineItems
+      );
 
       const newBusinessContractName = (dp.dealname || 'Contract')
         .replace(' — New Business', '')
@@ -3664,21 +3820,45 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
 
       // ── RENEWAL — creates NEW contract, expires old one ───────────
       if (category === 'renewal') {
-        const renewalStart = dp.contract_start_date || fmtDateForHS(new Date());
-        let renewalEnd = dp.contract_end_date;
-        if (!renewalEnd) {
-          const ed = new Date(renewalStart);
-          ed.setFullYear(ed.getFullYear() + 1);
-          renewalEnd = fmtDateForHS(ed);
-        }
-
         const companyIds = await getAssociatedIds(contractTypeId, cid, '0-2');
         const companyId = companyIds.length > 0 ? companyIds[0] : null;
         const lineItems = await getDealLineItems();
+        // Anchor the renewal contract on the actual renewal line items when
+        // the deal-level dates are missing or off (see reconcileContractDates).
+        const { startDate: renewalStart, endDate: renewalEnd } = reconcileContractDates(
+          dp.contract_start_date,
+          dp.contract_end_date,
+          lineItems
+        );
 
-        // Create new contract for the renewal term
+        // Create new contract for the renewal term. previous_contract_term
+        // captures the source contract's term length (in months) so the
+        // sales/CS team can see at a glance "this is a renewal of an N-month
+        // contract" without having to chase the lineage chain.
         const contractName = (cp.contract_name || 'Contract').replace(/ — Renewal.*$/, '');
-        const newContract = await createObject(contractTypeId, {
+        const renewalTermMonths = (() => {
+          const start = parseDateValue(renewalStart);
+          const end = parseDateValue(renewalEnd);
+          if (!start || !end || start > end) return null;
+          const months =
+            (end.getUTCFullYear() - start.getUTCFullYear()) * 12 +
+            (end.getUTCMonth() - start.getUTCMonth()) +
+            (end.getUTCDate() >= start.getUTCDate() ? 1 : 0);
+          return months > 0 ? months : null;
+        })();
+        const previousContractTerm =
+          parseInt(cp.contract_term, 10) ||
+          (() => {
+            const start = parseDateValue(getContractStartDate(cp));
+            const end = parseDateValue(getContractEndDate(cp));
+            if (!start || !end || start > end) return null;
+            const months =
+              (end.getUTCFullYear() - start.getUTCFullYear()) * 12 +
+              (end.getUTCMonth() - start.getUTCMonth()) +
+              (end.getUTCDate() >= start.getUTCDate() ? 1 : 0);
+            return months > 0 ? months : null;
+          })();
+        const newContractProps = {
           contract_name: contractName,
           status: determineStatus(renewalStart, renewalEnd),
           startdate: renewalStart,
@@ -3691,7 +3871,15 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
           replaces_contract: cid,
           contract_renewed_on: fmtDateForHS(new Date()),
           has_legacy_products: cp.has_legacy_products || 'false',
-        });
+        };
+        if (renewalTermMonths) {
+          newContractProps.contract_term = String(renewalTermMonths);
+          newContractProps.renewal_term = String(renewalTermMonths);
+        }
+        if (previousContractTerm) {
+          newContractProps.previous_contract_term = String(previousContractTerm);
+        }
+        const newContract = await createObject(contractTypeId, newContractProps);
 
         // Associate new contract to deal, company, contacts
         try { await createAssociation(contractTypeId, newContract.id, '0-3', dealId); } catch (e) { /* ok */ }
@@ -3800,9 +3988,17 @@ app.post('/api/update-contract-from-deal', async (req, res) => {
           });
 
           if (subscriptionTypeId) {
+            // segment_year must anchor on the CONTRACT's actual start date,
+            // not the amendment effective date — otherwise a year-2 line
+            // item gets stamped year-1 because the math is computed from a
+            // point partway through the contract. The amendStartDate /
+            // amendEndDate are still passed as fallbacks for line items
+            // missing their own dates.
+            const contractAnchoredStart = getContractStartDate(cp) || amendStartDate;
+            const contractAnchoredEnd = getContractEndDate(cp) || amendEndDate;
             const result = await createSegmentsFromLineItems(cid, lineItems, {
-              startDate: amendStartDate,
-              endDate: amendEndDate,
+              startDate: contractAnchoredStart,
+              endDate: contractAnchoredEnd,
               revenueType: category === 'amendment' ? 'renewal' : category,
               amendmentIndicator: category === 'expansion' ? 'Expansion' : (category === 'contraction' ? 'Contraction' : 'Renewal'),
               dealCategory: category,

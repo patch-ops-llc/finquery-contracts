@@ -81,7 +81,13 @@ const DEAL_PROPS = [
 const LINE_ITEM_PROPS = [
   'name',
   'description',
+  // `dh_quantity` is the DealHub-managed seat / unit count. `quantity` is
+  // the HubSpot-native field; DealHub sets this to `dh_quantity ×
+  // dh_duration` for monthly-priced products (e.g. 40 seats × 12 months =
+  // 480), and to plain seats for annually-priced products. We need both
+  // to compute annual ARR correctly across pricing conventions.
   'dh_quantity',
+  'quantity',
   'price',
   'amount',
   'hs_sku',
@@ -110,6 +116,7 @@ const CONTRACT_LINE_ITEM_PROPS = [
   'name',
   'description',
   'dh_quantity',
+  'quantity',
   'price',
   'amount',
   'hs_sku',
@@ -366,11 +373,56 @@ function buildYearSegments(startDateStr, endDateStr) {
   return segments;
 }
 
+// Annualized ARR for a single recurring line item. DealHub stores monthly-
+// priced products with the HubSpot-native `quantity` field set to seats ×
+// months (e.g. 40 seats × 12 months = 480), while `dh_quantity` is plain
+// seats — so `dh_quantity × price` underreports by the duration multiplier
+// for any monthly-priced line. The HubSpot-native `amount` field (= price ×
+// quantity) is the safest source of truth across both monthly and annual
+// pricing conventions; we fall back to `quantity × price`, then to
+// `dh_quantity × price` when neither is set.
 function getLineItemAnnualArr(lineItem) {
   const props = lineItem?.properties || {};
-  const quantity = Number(props.dh_quantity || 1) || 1;
+  const amount = Number(props.amount || 0);
+  if (Number.isFinite(amount) && amount > 0) return amount;
   const unitPrice = Number(props.price || 0) || 0;
-  return unitPrice * quantity;
+  const hsQuantity = Number(props.quantity || 0);
+  if (Number.isFinite(hsQuantity) && hsQuantity > 0 && unitPrice > 0) {
+    return unitPrice * hsQuantity;
+  }
+  const dhQuantity = Number(props.dh_quantity || 1) || 1;
+  return unitPrice * dhQuantity;
+}
+
+// Extract [year, month0, day] from a date input. Prefers the YYYY-MM-DD prefix
+// of an ISO string when present (avoids timezone-shift bugs where e.g.
+// '2026-04-30T19:00:00Z' is the same calendar date as '2026-05-01' in CDT but
+// getUTCDate() returns 30, putting the contract anchor a day before the line
+// items and shifting every segment's year stamp by one). Falls back to UTC
+// date methods for plain epoch ms values.
+function parseYearMonthDay(value) {
+  if (!value && value !== 0) return null;
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) return null;
+    return [value.getUTCFullYear(), value.getUTCMonth(), value.getUTCDate()];
+  }
+  const str = String(value).trim();
+  if (!str) return null;
+  const ymd = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (ymd) {
+    return [Number(ymd[1]), Number(ymd[2]) - 1, Number(ymd[3])];
+  }
+  if (/^\d+$/.test(str)) {
+    const d = new Date(Number(str));
+    if (!Number.isNaN(d.getTime())) {
+      return [d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()];
+    }
+  }
+  const d = new Date(str);
+  if (!Number.isNaN(d.getTime())) {
+    return [d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()];
+  }
+  return null;
 }
 
 // Returns the 1-indexed contract year that contains `segmentStart`, anchored
@@ -385,12 +437,12 @@ function getLineItemAnnualArr(lineItem) {
 // contract-anchored year stamped, the card's useSegmentYearBucketing path
 // works on the first read.
 function computeContractYear(segmentStartStr, contractStartStr) {
-  const segStart = parseDateValue(segmentStartStr);
-  const contractStart = parseDateValue(contractStartStr);
-  if (!segStart || !contractStart) return null;
-  const yearsDiff = segStart.getUTCFullYear() - contractStart.getUTCFullYear();
-  const monthsDiff = segStart.getUTCMonth() - contractStart.getUTCMonth();
-  const daysDiff = segStart.getUTCDate() - contractStart.getUTCDate();
+  const seg = parseYearMonthDay(segmentStartStr);
+  const con = parseYearMonthDay(contractStartStr);
+  if (!seg || !con) return null;
+  const yearsDiff = seg[0] - con[0];
+  const monthsDiff = seg[1] - con[1];
+  const daysDiff = seg[2] - con[2];
   let totalMonths = yearsDiff * 12 + monthsDiff;
   if (daysDiff < 0) totalMonths -= 1;
   const year = Math.floor(totalMonths / 12) + 1;
@@ -880,14 +932,61 @@ exports.main = async (event, callback) => {
 
     const lineItemsProcessed = lineItems.length;
 
+    // Resolve [start, end] for every line item up front so we can anchor the
+    // contract start/end on the actual line item dates when the deal-level
+    // contract_start_date / contract_end_date are missing, mismatched, or
+    // off-by-one. This is critical for segment_year stamping: if the deal
+    // says contract_start = 5/15/2026 but line items start 5/1/2026, every
+    // segment_year computed against 5/15/2026 ends up off by ~half a year
+    // and the contract card buckets year 2 lines into year 1.
+    const lineSpans = lineItems.map((li) => resolveLineItemSpan(li, null, null));
+    const lineStartDates = lineSpans
+      .map((s) => parseDateValue(s.startDate))
+      .filter(Boolean)
+      .sort((a, b) => a - b);
+    const lineEndDates = lineSpans
+      .map((s) => parseDateValue(s.endDate))
+      .filter(Boolean)
+      .sort((a, b) => a - b);
+    const earliestLineStart = lineStartDates[0]
+      ? fmtDateForHS(lineStartDates[0])
+      : null;
+    const latestLineEnd = lineEndDates.length
+      ? fmtDateForHS(lineEndDates[lineEndDates.length - 1])
+      : null;
+
+    // Normalize the deal-level dates to YYYY-MM-DD so downstream string-
+    // based comparisons (computeContractYear, status checks, etc.) don't
+    // get tripped up by ISO timestamps with timezone offsets.
+    const dealStartNormalized = dealProps.contract_start_date
+      ? fmtDateForHS(parseDateValue(dealProps.contract_start_date))
+      : null;
+    const dealEndNormalized = dealProps.contract_end_date
+      ? fmtDateForHS(parseDateValue(dealProps.contract_end_date))
+      : null;
+
+    // Line items are AUTHORITATIVE for the actual billing schedule — DealHub
+    // frequently sets the deal-level contract_end_date one day past the
+    // boundary (e.g. 5/1/2029 instead of 4/30/2029 for a 3-year contract
+    // starting 5/1/2026), which causes the contract record's `enddate` to be
+    // wrong, the renewal preview to be off-by-one, and a buildYearSegments
+    // tail-stub to leak into the year breakdown ("may 1 → may 1" 1-day
+    // "Year N+1"). When line items are present we trust their boundaries
+    // unconditionally; the deal-level dates are only used when no line
+    // items are available.
     const derivedStartDate =
-      dealProps.contract_start_date ||
+      earliestLineStart ||
+      dealStartNormalized ||
       fmtDateForHS(parseDateValue(dealProps.closedate) || new Date()) ||
       fmtDateForHS(new Date());
-    const derivedEndDate =
-      dealProps.contract_end_date ||
-      addYearsToDateString(derivedStartDate, 1) ||
-      fmtDateForHS(new Date());
+
+    let derivedEndDate = latestLineEnd || dealEndNormalized;
+    if (!derivedEndDate) {
+      const ed = parseDateValue(derivedStartDate) || new Date();
+      ed.setUTCFullYear(ed.getUTCFullYear() + 1);
+      ed.setUTCDate(ed.getUTCDate() - 1);
+      derivedEndDate = fmtDateForHS(ed);
+    }
 
     const category = String(dealProps.deal_category || 'new_business').toLowerCase();
     const isRenewal = category === 'renewal';
@@ -1205,6 +1304,7 @@ exports.main = async (event, callback) => {
           name: lp.name || 'Product',
           description: lp.description || '',
           dh_quantity: lp.dh_quantity || '1',
+          quantity: lp.quantity || '',
           price: lp.price || '0',
           amount: lp.amount || '',
           hs_sku: lp.hs_sku || '',
